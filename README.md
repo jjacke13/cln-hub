@@ -1,5 +1,7 @@
 # cln-hub
 
+> **DO NOT USE WITH REAL FUNDS YET**
+>
 > **THIS IS A WORK IN PROGRESS**
 
 An [LndHub](https://github.com/BlueWallet/LndHub)-compatible HTTP API server, implemented as a [Core Lightning](https://github.com/ElementsProject/lightning) plugin.
