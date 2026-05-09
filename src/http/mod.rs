@@ -111,6 +111,9 @@ pub fn router(
         // accept on-chain yet, so always empty — but having it return
         // 200+`[]` rather than 404 keeps stricter clients happy.
         .route("/getpending", get(payment::getpending))
+        // `/getbtc` returns the user's on-chain deposit address
+        // (minted on first call, persistent after).
+        .route("/getbtc", get(payment::getbtc))
         // Single state arc shared by every handler.
         .with_state(state)
         // Request logger sits OUTSIDE `.with_state` so it logs every

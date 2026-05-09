@@ -140,6 +140,37 @@ async fn main() -> Result<()> {
         }
     });
 
+    // ---- Periodic token cleanup ----
+    //
+    // Every hour, delete `tokens` rows where the refresh half has
+    // expired (created_at older than 31 days). These rows already
+    // can't authenticate anything — TTL is enforced at lookup time —
+    // but a long-running busy hub would accumulate rows forever
+    // without this. We do it as a fire-and-forget tokio task; it
+    // dies along with the runtime when lightningd shuts us down.
+    //
+    // === Rust note: `tokio::spawn` ownership ===
+    //
+    // `state` is an `Arc<AppState>`, so `Arc::clone(&state)` is
+    // cheap — just bumps the refcount. The cloned Arc moves into
+    // the async task and lives as long as the task does.
+    let cleanup_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        // First tick fires immediately; consume it so we wait an hour
+        // before the first cleanup pass.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match db::tokens::cleanup_expired(&cleanup_state.db).await {
+                Ok(0) => log::debug!("token cleanup: 0 expired rows"),
+                Ok(n) => log::info!("token cleanup: removed {} expired rows", n),
+                Err(e) => log::warn!("token cleanup failed: {}", e),
+            }
+        }
+    });
+
     // ---- Phase 2: start (commit the state, begin event loop) ----
     //
     // After this, lightningd considers us "running" and can deliver

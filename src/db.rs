@@ -214,6 +214,21 @@ pub mod tokens {
         .await?;
         Ok(row.map(|(id,)| id))
     }
+
+    /// Delete tokens whose refresh half has expired (i.e. nothing in
+    /// the row can possibly authenticate any more). Returns the number
+    /// of rows removed.
+    ///
+    /// Called periodically by `main`'s background task — see the
+    /// `tokio::spawn` near the bottom of `main.rs`.
+    pub async fn cleanup_expired(pool: &Pool) -> Result<u64> {
+        let cutoff = unix_now() - REFRESH_TTL_SECS;
+        let result = sqlx::query("DELETE FROM tokens WHERE created_at < ?")
+            .bind(cutoff)
+            .execute(pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 // =====================================================================
@@ -400,6 +415,41 @@ pub mod payments {
         );
         let rows: Vec<RowTuple> = sqlx::query_as(&q).bind(user_id).fetch_all(pool).await?;
         Ok(rows.into_iter().map(from_tuple).collect())
+    }
+}
+
+// =====================================================================
+// addresses (on-chain deposit)
+// =====================================================================
+
+/// Per-user on-chain deposit address. Each user has at most one,
+/// minted lazily on first /getbtc call.
+pub mod addresses {
+    use super::{unix_now, Pool, Result};
+
+    /// Look up the user's existing deposit address.
+    pub async fn for_user(pool: &Pool, user_id: i64) -> Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT address FROM addresses WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_optional(pool)
+                .await?;
+        Ok(row.map(|(a,)| a))
+    }
+
+    /// Insert a freshly-minted address for a user. Errors if the user
+    /// already has one (the UNIQUE PRIMARY KEY on user_id catches it),
+    /// which the caller should handle by re-reading via `for_user`.
+    pub async fn create(pool: &Pool, user_id: i64, address: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO addresses (user_id, address, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(address)
+        .bind(unix_now())
+        .execute(pool)
+        .await?;
+        Ok(())
     }
 }
 

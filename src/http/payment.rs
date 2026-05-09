@@ -240,13 +240,80 @@ pub(super) async fn getbalance(
 
 /// `GET /getpending` — list pending on-chain deposits.
 ///
-/// We don't yet accept on-chain deposits (that's a future slice with
-/// proper address-tracking + confirmation accounting), so this always
-/// returns `[]`. Having it answer 200 instead of 404 keeps stricter
-/// LndHub clients (BlueWallet, Zeus) from treating the hub as broken
-/// when they probe this endpoint at session start.
+/// We don't yet credit on-chain deposits (the polling task that
+/// would watch CLN's `listfunds` and call `db::ledger::credit` is
+/// a future slice). Returning `[]` keeps stricter LndHub clients
+/// happy at session start without misrepresenting state.
 pub(super) async fn getpending(_auth: AuthUser) -> Json<Value> {
     Json(Value::Array(vec![]))
+}
+
+// =====================================================================
+// /getbtc
+// =====================================================================
+
+/// `GET /getbtc` — return the authenticated user's on-chain deposit
+/// address.
+///
+/// Behaviour:
+///   - First call: ask CLN for a fresh bech32 address via `newaddr`,
+///     store it in our `addresses` table keyed by user_id.
+///   - Subsequent calls: return the same persisted address.
+///
+/// Response shape (matching original LndHub):
+///     [{"address": "bc1q..."}]
+///
+/// **Known limitation as of slice 5d**: deposits TO this address land
+/// in CLN's on-chain wallet but are NOT yet credited to the user's
+/// internal balance. A future slice will add a polling task that
+/// watches `lightning-cli listfunds` for new confirmed outputs to
+/// our addresses and writes corresponding `ledger` rows.
+pub(super) async fn getbtc(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+) -> Result<Json<Value>, AppError> {
+    // Already minted?
+    if let Some(addr) = db::addresses::for_user(&state.db, auth.user_id).await? {
+        return Ok(Json(json!([{ "address": addr }])));
+    }
+
+    // Otherwise mint a fresh one. CLN's `newaddr` defaults to bech32.
+    let resp = cln::call(&state.rpc_path, "newaddr", json!({"addresstype": "bech32"})).await?;
+
+    let address = resp
+        .get("bech32")
+        .and_then(|v| v.as_str())
+        .or_else(|| resp.get("address").and_then(|v| v.as_str()))
+        .ok_or_else(|| {
+            AppError::internal(anyhow::anyhow!(
+                "lightningd `newaddr` response missing bech32: {:?}",
+                resp
+            ))
+        })?
+        .to_string();
+
+    // Persist. If two concurrent /getbtc calls race, one will fail
+    // the UNIQUE PRIMARY KEY constraint — fall back to a re-read so
+    // both callers still get a valid address.
+    if let Err(e) = db::addresses::create(&state.db, auth.user_id, &address).await {
+        log::debug!(
+            "addresses::create failed for user {} (likely race): {}",
+            auth.user_id,
+            e
+        );
+        if let Some(existing) = db::addresses::for_user(&state.db, auth.user_id).await? {
+            return Ok(Json(json!([{ "address": existing }])));
+        }
+        return Err(AppError::internal(e));
+    }
+
+    log::info!(
+        "minted deposit address for user {}: {} (note: deposits not yet auto-credited)",
+        auth.user_id,
+        address
+    );
+
+    Ok(Json(json!([{ "address": address }])))
 }
 
 // =====================================================================
