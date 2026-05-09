@@ -171,6 +171,14 @@ async fn main() -> Result<()> {
         }
     });
 
+    // ---- On-chain deposit watcher ----
+    //
+    // Polls `lightning-cli listfunds` periodically; any confirmed
+    // UTXO sent to an address we minted via /getbtc gets credited
+    // to the owning user. See `plugin::deposit_watcher` for details.
+    let watcher_state = Arc::clone(&state);
+    tokio::spawn(plugin::deposit_watcher(watcher_state));
+
     // ---- Phase 2: start (commit the state, begin event loop) ----
     //
     // After this, lightningd considers us "running" and can deliver

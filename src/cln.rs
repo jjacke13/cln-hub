@@ -97,3 +97,23 @@ pub async fn call(socket: &Path, method: &str, params: Value) -> Result<Value> {
         Err(anyhow!("malformed lightningd response: {}", resp))
     }
 }
+
+/// Parse a CLN `msat` field as it appears on the wire.
+///
+/// CLN's wire format for millisatoshi values has shifted between
+/// releases. We accept all known shapes:
+///   - integer:                `1000`
+///   - "Nmsat" string:         `"1000msat"`
+///   - bare numeric string:    `"1000"`
+///
+/// Returns `None` for anything else.
+pub fn parse_msat(v: &Value) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    if let Some(s) = v.as_str() {
+        let trimmed = s.strip_suffix("msat").unwrap_or(s);
+        return trimmed.parse().ok();
+    }
+    None
+}

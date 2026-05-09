@@ -639,6 +639,72 @@ pub async fn try_settle_internal(
 }
 
 // =====================================================================
+// Atomic credit-on-deposit (slice 5e)
+// =====================================================================
+
+/// Credit a confirmed on-chain UTXO to the owning user.
+///
+/// Idempotent: the `(txid, vout)` PRIMARY KEY in `onchain_credits`
+/// plus the `INSERT OR IGNORE` mean a re-scan that re-encounters the
+/// same UTXO is a no-op. Returns `Ok(true)` if a credit happened,
+/// `Ok(false)` if the UTXO had already been processed.
+///
+/// Both INSERTs run in a single transaction so a crash mid-way
+/// cannot leave us with the credit recorded but the ledger row
+/// missing (or vice-versa).
+pub async fn credit_onchain(
+    pool: &Pool,
+    txid: &str,
+    vout: i64,
+    user_id: i64,
+    address: &str,
+    amount_msat: i64,
+    blockheight: Option<i64>,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let now = unix_now();
+
+    // (1) Mark the UTXO as credited. `INSERT OR IGNORE` returns 0
+    //     rows-affected if (txid, vout) already exists.
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO onchain_credits \
+            (txid, vout, user_id, address, amount_msat, blockheight, credited_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(txid)
+    .bind(vout)
+    .bind(user_id)
+    .bind(address)
+    .bind(amount_msat)
+    .bind(blockheight)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    if inserted == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
+    // (2) Credit the ledger.
+    sqlx::query(
+        "INSERT INTO ledger (user_id, kind, amount_msat, ref_hash, description, created_at) \
+         VALUES (?, 'onchain_in', ?, ?, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(amount_msat)
+    .bind(txid)
+    .bind(format!("on-chain deposit (vout {})", vout))
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(true)
+}
+
+// =====================================================================
 // Atomic credit-on-settle (slice 4)
 // =====================================================================
 
