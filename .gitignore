@@ -1,0 +1,30 @@
+# Cargo build artifacts (the entire compiled output tree).
+/target/
+
+# Cargo.lock policy:
+#   - Binary projects: COMMIT it (reproducible builds across machines).
+#   - Library projects: do not commit.
+# cln-hub is a binary, so we keep it. (No ignore line.)
+
+# IDE / editor scratch.
+/.vscode/
+/.idea/
+*.swp
+*.swo
+
+# Local developer overrides — env vars, secrets, override flake.
+.env
+.envrc
+.direnv/
+flake.override.nix
+
+# Local SQLite databases (created at runtime).
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Nix build outputs (the symlink `cargo build` doesn't create, but
+# `nix build` does).
+/result
+/result-*

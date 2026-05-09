@@ -1,0 +1,95 @@
+# Cargo.toml
+#
+# The Rust equivalent of package.json / pyproject.toml. It declares:
+#   - the package metadata (name, version, edition)
+#   - the dependencies (and their feature flags)
+#   - build settings
+#
+# Cargo is Rust's official build tool, package manager, and test runner
+# all in one. `cargo build` reads this file, downloads what's needed
+# into `target/`, and produces a binary at `target/debug/cln-hub`.
+
+[package]
+name        = "cln-hub"
+version     = "0.1.0"
+edition     = "2021"
+description = "LndHub-compatible HTTP API server, served as a Core Lightning plugin."
+license     = "MIT"
+authors     = ["Vaios K"]
+
+# A "binary" crate produces an executable (vs a library crate, which
+# produces a .rlib for other crates to depend on). The default binary
+# is built from src/main.rs.
+
+[dependencies]
+
+# Official Core Lightning plugin library from Blockstream.
+# It implements the JSON-RPC handshake `lightningd` performs over our
+# stdin/stdout, exposes hooks/notifications/options, and lets us call
+# back into lightningd's RPC.
+cln-plugin = "0.3"
+
+# Async runtime. Rust's `async fn` produces "futures" but doesn't ship
+# with anything to actually drive them — you bring your own runtime.
+# `tokio` is the de-facto choice for network/server code. The "full"
+# feature set pulls in the executor, timers, network I/O, sync
+# primitives, signal handling, etc.
+tokio = { version = "1", features = ["full"] }
+
+# Convenience error type for prototyping. `anyhow::Error` is a single
+# type that can hold any error, with a backtrace and a chain of causes.
+# We use it during early development; we may swap it for a custom
+# error enum later (more precise, harder to mis-match).
+anyhow = "1"
+
+# Serialization framework. cln-plugin needs serde_json for the wire
+# protocol; we'll also use it for our HTTP responses.
+# `derive` enables `#[derive(Serialize, Deserialize)]` macros.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging facade. `cln-plugin` automatically routes `log::info!` (and
+# friends) into lightningd's log stream, which is exactly what we want:
+# our plugin's logs end up alongside lightningd's, visible via
+# `lightning-cli getlog` or the lightningd log file.
+log = "0.4"
+
+# HTTP server framework. axum is built on top of tokio + tower + hyper
+# and is the de-facto choice for Rust web services in 2025-26. Default
+# features include JSON support, query/form extractors, and an HTTP/1
+# server, which is everything we need for an LndHub-style REST API.
+axum = "0.7"
+
+# Async SQL toolkit. We use it as our SQLite driver, query builder,
+# and migration runner. Compile-time-checked queries (`sqlx::query!`)
+# are available via the `macros` feature (default-on), but we use the
+# runtime-checked `sqlx::query()` variant in this project to avoid
+# requiring a live database during `cargo build` — simpler for Nix
+# packaging and CI.
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
+
+# Argon2id password hashing — the modern recommendation (winner of the
+# Password Hashing Competition, RFC 9106). Memory-hard so brute-forcing
+# stolen hashes is expensive.
+argon2 = "0.5"
+
+# Cryptographically-secure RNG (via `rand::rngs::OsRng`) for generating
+# logins, passwords, and access/refresh tokens.
+rand = "0.8"
+
+# Hex encoding/decoding. LndHub's tokens and our random IDs are
+# encoded as lowercase hex strings, matching what the original
+# Node.js LndHub does.
+hex = "0.4"
+
+# Build profiles tune the compiler.
+# - `dev`   (cargo build)         : fast compile, no optimization, debug info.
+# - `release` (cargo build --release) : full optimization, slow compile.
+[profile.release]
+# Link-time optimization across the whole binary. Slower link, smaller
+# and faster output. Worth it for a long-running server.
+lto = true
+# A single codegen unit is required for the most aggressive inlining.
+codegen-units = 1
+# Strip debug symbols from the release binary for a smaller artifact.
+strip = true
