@@ -94,12 +94,11 @@ pub mod users {
     }
 
     /// Verify a login/password pair. Returns:
-    ///   - `Ok(Some(id))`  on a match
-    ///   - `Ok(None)`      on either "no such login" or "wrong password"
-    ///                     (we collapse them to avoid leaking which one
-    ///                     of the two was wrong — common credential-
-    ///                     stuffing mitigation)
-    ///   - `Err(_)`        on a database/cryptography error
+    ///   - `Ok(Some(id))` on a match
+    ///   - `Ok(None)` on either "no such login" or "wrong password"
+    ///     (we collapse them to avoid leaking which one of the two
+    ///     was wrong — common credential-stuffing mitigation)
+    ///   - `Err(_)` on a database/cryptography error
     pub async fn verify(pool: &Pool, login: &str, password: &str) -> Result<Option<i64>> {
         // `query_as::<_, (i64, String)>` says "decode each row as a
         // tuple of these types". The `_` is the database type, which
