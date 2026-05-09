@@ -1,5 +1,7 @@
 # cln-hub
 
+> **THIS IS A WORK IN PROGRESS**
+
 An [LndHub](https://github.com/BlueWallet/LndHub)-compatible HTTP API server, implemented as a [Core Lightning](https://github.com/ElementsProject/lightning) plugin.
 
 The same REST surface that BlueWallet, Zeus, and other LndHub clients already speak — but backed by a CLN node instead of LND, shipped as a single Rust binary you drop next to `lightningd`.
