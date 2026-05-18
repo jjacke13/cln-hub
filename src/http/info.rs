@@ -36,6 +36,13 @@ pub(super) async fn decodeinvoice(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DecodeReq>,
 ) -> Result<Json<Value>, AppError> {
+    // Hard cap inbound BOLT11 length before relaying it to CLN's
+    // unix-socket RPC. Keeps a malicious client from shoving a 2 MB
+    // request straight into lightningd's single-threaded RPC loop.
+    if req.invoice.len() > 4096 {
+        return Err(AppError::bad_request("invoice too long"));
+    }
+
     let resp = cln::call(
         &state.rpc_path,
         "decode",
@@ -54,7 +61,12 @@ pub(super) async fn decodeinvoice(
     if let Some(payee) = resp.get("payee").and_then(|v| v.as_str()) {
         out["destination"] = json!(payee);
     }
-    if let Some(amount_msat) = resp.get("amount_msat").and_then(|v| v.as_i64()) {
+    // `amount_msat` may be a JSON integer (newer CLN) or a `"<n>msat"`
+    // string (older CLN). `cln::parse_msat` handles both shapes — a
+    // bare `as_i64` would silently report amountless on the string
+    // form.
+    if let Some(amount_msat) = resp.get("amount_msat").and_then(cln::parse_msat) {
+        let amount_msat = amount_msat as i64;
         out["num_satoshis"] = json!((amount_msat / 1000).to_string());
         out["num_msat"] = json!(amount_msat.to_string());
     }

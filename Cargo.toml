@@ -82,6 +82,13 @@ rand = "0.8"
 # Node.js LndHub does.
 hex = "0.4"
 
+# SHA-256. Tokens are stored hashed (not plaintext) so the DB never
+# holds direct bearer credentials and the lookup path compares hashes
+# — uniform-prefix distribution removes the byte-by-byte timing oracle
+# on the inbound token. Already a transitive dep via argon2; promoting
+# to an explicit dep so the use is visible to anyone auditing.
+sha2 = "0.10"
+
 # Build profiles tune the compiler.
 # - `dev`   (cargo build)         : fast compile, no optimization, debug info.
 # - `release` (cargo build --release) : full optimization, slow compile.

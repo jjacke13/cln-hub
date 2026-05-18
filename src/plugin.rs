@@ -160,6 +160,31 @@ pub async fn deposit_watcher(state: Arc<AppState>) {
 ///   picks those up.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Refusal-to-refund guards for the case where CLN's `listpays`
+/// returns no record at all of a hash we have in `external_pending`.
+///
+/// The naive thing is to assume "CLN never saw this payment, refund
+/// it." That's unsafe: `listpays` can transiently return empty for a
+/// payment that actually completed — CLN restart in the middle of
+/// writing out the pay, a version-skew in the response schema, a
+/// brief socket hiccup, etc. Refunding in those windows would
+/// double-credit the user (they paid once successfully AND got the
+/// reserve back) and drain the hub.
+///
+/// Two guards before we refund on empty `listpays`:
+///   1. **Minimum age.** The row must be older than `MIN_REFUND_AGE`,
+///      giving any in-flight HTLCs and CLN-side bookkeeping time to
+///      surface in `listpays`.
+///   2. **Minimum consecutive empty sweeps.** We require N empty
+///      sightings, persisted to disk between sweeps so a process
+///      restart doesn't reset the count.
+///
+/// Even one non-empty `listpays` response (regardless of its status)
+/// resets the counter, so the refund only fires on sustained absence,
+/// not transient flicker.
+const MIN_REFUND_AGE: Duration = Duration::from_secs(300);
+const MIN_EMPTY_SWEEPS_BEFORE_REFUND: i64 = 3;
+
 pub async fn payment_reconciler(state: Arc<AppState>) {
     // Startup pass first — we may have pending rows from a crashed
     // previous run.
@@ -222,16 +247,56 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
         .cloned()
         .unwrap_or_default();
 
-    // No record on CLN's side. Could mean: we crashed BEFORE `pay`
-    // got far enough to register an attempt. In that case the user's
-    // funds are still notionally "in flight" with nothing real
-    // happening. Refund to be safe.
+    // ---- Empty listpays: handle very conservatively. ----
+    //
+    // The naive read is "CLN doesn't know this hash, so refund the
+    // user." That's unsafe: a transiently-empty response (CLN restart
+    // mid-write, a brief schema/socket hiccup, a different CLN
+    // version's response shape) would refund a payment that actually
+    // completed, costing the hub the routed amount.
+    //
+    // We require BOTH:
+    //   - the row to be older than `MIN_REFUND_AGE` (no jumpy refunds
+    //     on payments that just started),
+    //   - and N consecutive empty sweeps recorded in the DB (so a
+    //     transient flicker doesn't accrue toward the refund).
     if pays.is_empty() {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(p.created_at);
+        let age = now_secs - p.created_at;
+
+        if age < MIN_REFUND_AGE.as_secs() as i64 {
+            log::debug!(
+                "reconcile: hash={} empty listpays but age {}s < {}s — leaving pending",
+                p.payment_hash,
+                age,
+                MIN_REFUND_AGE.as_secs()
+            );
+            return Ok(());
+        }
+
+        let sweeps =
+            db::bump_empty_listpays_sweeps(&state.db, p.user_id, &p.payment_hash).await?;
+
+        if sweeps < MIN_EMPTY_SWEEPS_BEFORE_REFUND {
+            log::info!(
+                "reconcile: hash={} empty listpays sweep {} of {} — leaving pending",
+                p.payment_hash,
+                sweeps,
+                MIN_EMPTY_SWEEPS_BEFORE_REFUND
+            );
+            return Ok(());
+        }
+
         log::warn!(
-            "reconcile: hash={} not known to listpays; refunding (assumed never sent)",
-            p.payment_hash
+            "reconcile: hash={} empty listpays for {} sweeps (age {}s); refunding",
+            p.payment_hash,
+            sweeps,
+            age
         );
-        db::fail_external_pay(
+        let refunded = db::fail_external_pay(
             &state.db,
             p.user_id,
             &p.payment_hash,
@@ -239,11 +304,30 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
             p.fee_reserve_msat,
         )
         .await?;
+        if !refunded {
+            log::info!(
+                "reconcile: hash={} fail no-op — row finalized by another path",
+                p.payment_hash
+            );
+        }
         return Ok(());
     }
 
+    // CLN returned a real listpays entry — clear the empty-sweep
+    // counter regardless of status. We only refund on SUSTAINED
+    // empty streaks, not interleaved flicker.
+    db::reset_empty_listpays_sweeps(&state.db, p.user_id, &p.payment_hash).await?;
+
     // Take the LAST attempt (most recent). CLN appends; oldest first.
-    let last = pays.last().unwrap();
+    // `let-else` so a future refactor that breaks the `is_empty` guard
+    // can't turn this into a panic in a background task.
+    let Some(last) = pays.last() else {
+        log::warn!(
+            "reconcile: hash={} pays array unexpectedly empty after non-empty check; skipping",
+            p.payment_hash
+        );
+        return Ok(());
+    };
     let status = last
         .get("status")
         .and_then(|v| v.as_str())
@@ -257,7 +341,7 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
                 .unwrap_or(p.amount_msat);
             let actual_fee_msat = (sent_msat - p.amount_msat).max(0);
 
-            db::settle_external_pay(
+            let settled = db::settle_external_pay(
                 &state.db,
                 p.user_id,
                 &p.payment_hash,
@@ -267,16 +351,23 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
             )
             .await?;
 
-            log::info!(
-                "reconcile: settled hash={} user={} amount={}msat fee={}msat",
-                p.payment_hash,
-                p.user_id,
-                p.amount_msat,
-                actual_fee_msat
-            );
+            if settled {
+                log::info!(
+                    "reconcile: settled hash={} user={} amount={}msat fee={}msat",
+                    p.payment_hash,
+                    p.user_id,
+                    p.amount_msat,
+                    actual_fee_msat
+                );
+            } else {
+                log::debug!(
+                    "reconcile: settle no-op for hash={} (already finalized)",
+                    p.payment_hash
+                );
+            }
         }
         "failed" => {
-            db::fail_external_pay(
+            let failed = db::fail_external_pay(
                 &state.db,
                 p.user_id,
                 &p.payment_hash,
@@ -284,11 +375,18 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
                 p.fee_reserve_msat,
             )
             .await?;
-            log::info!(
-                "reconcile: failed hash={} user={} — refunded",
-                p.payment_hash,
-                p.user_id
-            );
+            if failed {
+                log::info!(
+                    "reconcile: failed hash={} user={} — refunded",
+                    p.payment_hash,
+                    p.user_id
+                );
+            } else {
+                log::debug!(
+                    "reconcile: fail no-op for hash={} (already finalized)",
+                    p.payment_hash
+                );
+            }
         }
         "pending" => {
             // Still in flight. Next sweep.

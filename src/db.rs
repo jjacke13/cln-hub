@@ -146,6 +146,26 @@ pub mod users {
 /// (used in `Authorization: Bearer <...>`) with a `refresh_token`
 /// (used to mint new tokens) and the `user_id` they belong to.
 ///
+/// === Storage: hashed, not plaintext ===
+///
+/// Migration 0008 switched this table to storing `sha256(token)`
+/// instead of the bearer-string itself. Why:
+///
+///   - **Timing-oracle hardening.** SQLite's `=` text comparison
+///     short-circuits on the first byte mismatch. Comparing the raw
+///     bearer string would leak prefix information to anyone able
+///     to measure response latency (especially via the
+///     unauthenticated `/auth` refresh-token path). Hashing produces
+///     a uniform-prefix distribution; the mismatch position carries
+///     no useful signal about the original token.
+///   - **Defense-in-depth at rest.** A DB dump no longer hands the
+///     attacker a usable bearer credential. SHA-256 is not slow
+///     enough to be a real KDF, but tokens are 160-bit hex random
+///     strings — there's no preimage attack to worry about.
+///
+/// Wire / response format unchanged: clients still receive the raw
+/// hex token. The hash only lives on disk.
+///
 /// === Token expiry ===
 ///
 /// Matching original LndHub semantics:
@@ -155,26 +175,41 @@ pub mod users {
 /// We don't store `expires_at` columns — the constants are folded
 /// into the SELECT predicate so an expired row simply won't match
 /// at lookup time. No background pruner needed (rows linger but
-/// are inert); a periodic cleanup task can be added later if disk
-/// pressure ever shows up.
+/// are inert); a periodic cleanup task removes long-expired rows
+/// for disk-usage hygiene.
 pub mod tokens {
     use super::{random_hex, unix_now, Pool, Result};
+
+    use sha2::{Digest, Sha256};
 
     pub const ACCESS_TTL_SECS: i64 = 7 * 24 * 60 * 60;
     pub const REFRESH_TTL_SECS: i64 = 31 * 24 * 60 * 60;
 
+    /// Hash a bearer-string the same way for both insert and lookup.
+    /// SHA-256 hex digest, lowercase, 64 chars.
+    ///
+    /// `pub(crate)` so unit tests in this module's `tests` submodule
+    /// can stage matching-hash rows without rederiving the function.
+    pub(crate) fn hash_token(token: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(token.as_bytes());
+        hex::encode(h.finalize())
+    }
+
     /// Mint a new access/refresh token pair for `user_id`. Both tokens
-    /// are 20 bytes of OS-randomness, hex-encoded (40 chars).
+    /// are 20 bytes of OS-randomness, hex-encoded (40 chars). The DB
+    /// stores their SHA-256 hex digests; the caller receives the raw
+    /// tokens for return to the HTTP client.
     pub async fn create(pool: &Pool, user_id: i64) -> Result<(String, String)> {
         let access = random_hex(20);
         let refresh = random_hex(20);
 
         sqlx::query(
-            "INSERT INTO tokens (access_token, refresh_token, user_id, created_at) \
+            "INSERT INTO tokens (access_token_hash, refresh_token_hash, user_id, created_at) \
              VALUES (?, ?, ?, ?)",
         )
-        .bind(&access)
-        .bind(&refresh)
+        .bind(hash_token(&access))
+        .bind(hash_token(&refresh))
         .bind(user_id)
         .bind(unix_now())
         .execute(pool)
@@ -192,9 +227,9 @@ pub mod tokens {
     pub async fn user_id_for_access(pool: &Pool, access_token: &str) -> Result<Option<i64>> {
         let cutoff = unix_now() - ACCESS_TTL_SECS;
         let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT user_id FROM tokens WHERE access_token = ? AND created_at >= ?",
+            "SELECT user_id FROM tokens WHERE access_token_hash = ? AND created_at >= ?",
         )
-        .bind(access_token)
+        .bind(hash_token(access_token))
         .bind(cutoff)
         .fetch_optional(pool)
         .await?;
@@ -205,9 +240,9 @@ pub mod tokens {
     pub async fn user_id_for_refresh(pool: &Pool, refresh_token: &str) -> Result<Option<i64>> {
         let cutoff = unix_now() - REFRESH_TTL_SECS;
         let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT user_id FROM tokens WHERE refresh_token = ? AND created_at >= ?",
+            "SELECT user_id FROM tokens WHERE refresh_token_hash = ? AND created_at >= ?",
         )
-        .bind(refresh_token)
+        .bind(hash_token(refresh_token))
         .bind(cutoff)
         .fetch_optional(pool)
         .await?;
@@ -818,15 +853,22 @@ pub async fn reserve_external_pay(
 /// reconciler when it finds a previously-pending payment that has
 /// since become `complete` in `listpays`.
 ///
-/// Effects (atomic):
+/// Effects (atomic, only when the row is still `external_pending`):
 ///   - payments row → `external_settled`, with preimage + actual fee.
 ///   - If `fee_reserve_msat > actual_fee_msat`, credit the difference
 ///     back to the user (`payment_fee_refund`).
 ///
 /// Idempotency: the UPDATE is gated on `status = 'external_pending'`,
-/// so a second call simply UPDATES zero rows. We then return an
-/// error so the caller can log "already finalized" if needed. (The
-/// reconciler treats this as a no-op.)
+/// so a second call simply UPDATES zero rows and we return
+/// `Ok(false)` — no error. The handler and the reconciler can both
+/// race to finalize the same row; whichever loses the race learns
+/// that the work was already done and reports success to its caller.
+///
+/// Returns:
+///   - `Ok(true)`  — this call settled the row.
+///   - `Ok(false)` — the row was already finalized (settled or failed)
+///     by a concurrent caller; no further work happened.
+///   - `Err(_)`    — database error.
 pub async fn settle_external_pay(
     pool: &Pool,
     user_id: i64,
@@ -834,7 +876,7 @@ pub async fn settle_external_pay(
     preimage: &str,
     actual_fee_msat: i64,
     fee_reserve_msat: i64,
-) -> Result<()> {
+) -> Result<bool> {
     let mut tx = pool.begin().await?;
     let now = unix_now();
 
@@ -853,12 +895,12 @@ pub async fn settle_external_pay(
     .rows_affected();
 
     if updated == 0 {
+        // Already finalized by a concurrent path (the
+        // /payinvoice in-band handler and the reconciler can race
+        // when CLN settles slowly). No error; caller picks up
+        // current row state if it needs to.
         tx.rollback().await?;
-        return Err(anyhow::anyhow!(
-            "settle_external_pay: no pending row for user {} hash {}",
-            user_id,
-            payment_hash
-        ));
+        return Ok(false);
     }
 
     // Refund unused fee reserve. Negative `unused` (over-spend) would
@@ -880,22 +922,25 @@ pub async fn settle_external_pay(
     }
 
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Finalize a terminally-failed external payment.
 ///
-/// Effects (atomic):
+/// Effects (atomic, only when the row is still `external_pending`):
 ///   - payments row → `external_failed`.
 ///   - Compensating credit for the FULL reserved amount (amount + fee
 ///     reserve) — the user is made whole.
+///
+/// Same idempotency contract as `settle_external_pay`: `Ok(false)`
+/// when another caller already finalized the row.
 pub async fn fail_external_pay(
     pool: &Pool,
     user_id: i64,
     payment_hash: &str,
     amount_msat: i64,
     fee_reserve_msat: i64,
-) -> Result<()> {
+) -> Result<bool> {
     let mut tx = pool.begin().await?;
     let now = unix_now();
     let total = amount_msat + fee_reserve_msat;
@@ -914,11 +959,7 @@ pub async fn fail_external_pay(
 
     if updated == 0 {
         tx.rollback().await?;
-        return Err(anyhow::anyhow!(
-            "fail_external_pay: no pending row for user {} hash {}",
-            user_id,
-            payment_hash
-        ));
+        return Ok(false);
     }
 
     sqlx::query(
@@ -933,6 +974,64 @@ pub async fn fail_external_pay(
     .await?;
 
     tx.commit().await?;
+    Ok(true)
+}
+
+/// Increment the empty-listpays-sweep counter on a pending payment
+/// row and return the new value. Used by the reconciler when CLN's
+/// `listpays` returns no record of a payment hash — we wait for
+/// several consecutive empty sightings before assuming the payment
+/// truly never left the node and refunding the user.
+///
+/// No-op if the row is no longer `external_pending` (a concurrent
+/// settle/fail already finalized it); the inner UPDATE matches zero
+/// rows and the subsequent SELECT just returns whatever count is on
+/// disk. The reconciler treats a no-op as "we lost the race, skip".
+pub async fn bump_empty_listpays_sweeps(
+    pool: &Pool,
+    user_id: i64,
+    payment_hash: &str,
+) -> Result<i64> {
+    sqlx::query(
+        "UPDATE payments \
+         SET empty_listpays_sweeps = empty_listpays_sweeps + 1 \
+         WHERE user_id = ? AND payment_hash = ? AND status = 'external_pending'",
+    )
+    .bind(user_id)
+    .bind(payment_hash)
+    .execute(pool)
+    .await?;
+
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT empty_listpays_sweeps FROM payments \
+         WHERE user_id = ? AND payment_hash = ?",
+    )
+    .bind(user_id)
+    .bind(payment_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|(n,)| n).unwrap_or(0))
+}
+
+/// Reset the empty-listpays-sweep counter when CLN reports any non-
+/// empty `listpays` payload for this payment hash. Even if the
+/// status is `pending`, we don't want a transient empty response
+/// later to count toward the refund threshold.
+pub async fn reset_empty_listpays_sweeps(
+    pool: &Pool,
+    user_id: i64,
+    payment_hash: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE payments \
+         SET empty_listpays_sweeps = 0 \
+         WHERE user_id = ? AND payment_hash = ? AND status = 'external_pending'",
+    )
+    .bind(user_id)
+    .bind(payment_hash)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1420,9 +1519,10 @@ mod tests {
         // After reserve: 100k - (50k + 10k) = 40k.
         assert_eq!(balance_msat(&pool, alice).await.unwrap(), 40_000);
 
-        settle_external_pay(&pool, alice, "rh4", "preimage_hex", 3_000, 10_000)
+        let settled = settle_external_pay(&pool, alice, "rh4", "preimage_hex", 3_000, 10_000)
             .await
             .unwrap();
+        assert!(settled, "first settle should report true");
         // 7k of 10k reserve refunded → 40k + 7k = 47k.
         assert_eq!(balance_msat(&pool, alice).await.unwrap(), 47_000);
     }
@@ -1435,11 +1535,37 @@ mod tests {
         reserve_external_pay(&pool, alice, "rh5", "lnbc", "m", 50_000, 10_000)
             .await
             .unwrap();
-        settle_external_pay(&pool, alice, "rh5", "preimage", 10_000, 10_000)
+        let settled = settle_external_pay(&pool, alice, "rh5", "preimage", 10_000, 10_000)
             .await
             .unwrap();
+        assert!(settled);
         // 10k reserve all consumed by fees → no refund. 40k stands.
         assert_eq!(balance_msat(&pool, alice).await.unwrap(), 40_000);
+    }
+
+    #[tokio::test]
+    async fn settle_external_second_call_returns_ok_false() {
+        // The handler and the reconciler may both call settle on the
+        // same row. The loser must not error — return Ok(false) and
+        // leave balances unchanged.
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        seed_balance(&pool, alice, 100_000).await;
+        reserve_external_pay(&pool, alice, "rh4b", "lnbc", "m", 50_000, 10_000)
+            .await
+            .unwrap();
+        let first = settle_external_pay(&pool, alice, "rh4b", "pre", 3_000, 10_000)
+            .await
+            .unwrap();
+        assert!(first);
+        let before = balance_msat(&pool, alice).await.unwrap();
+
+        let second = settle_external_pay(&pool, alice, "rh4b", "pre", 3_000, 10_000)
+            .await
+            .unwrap();
+        assert!(!second, "second settle should report false (already finalized)");
+        // Balance must not change on the second call.
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), before);
     }
 
     #[tokio::test]
@@ -1452,11 +1578,75 @@ mod tests {
             .unwrap();
         assert_eq!(balance_msat(&pool, alice).await.unwrap(), 40_000);
 
-        fail_external_pay(&pool, alice, "rh6", 50_000, 10_000)
+        let failed = fail_external_pay(&pool, alice, "rh6", 50_000, 10_000)
             .await
             .unwrap();
+        assert!(failed);
         // Full refund: 100k restored.
         assert_eq!(balance_msat(&pool, alice).await.unwrap(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn fail_external_second_call_returns_ok_false() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        seed_balance(&pool, alice, 100_000).await;
+        reserve_external_pay(&pool, alice, "rh6b", "lnbc", "m", 50_000, 10_000)
+            .await
+            .unwrap();
+        let first = fail_external_pay(&pool, alice, "rh6b", 50_000, 10_000)
+            .await
+            .unwrap();
+        assert!(first);
+        let before = balance_msat(&pool, alice).await.unwrap();
+
+        let second = fail_external_pay(&pool, alice, "rh6b", 50_000, 10_000)
+            .await
+            .unwrap();
+        assert!(!second, "second fail should be a no-op");
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn bump_and_reset_empty_listpays_sweeps() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        seed_balance(&pool, alice, 100_000).await;
+        reserve_external_pay(&pool, alice, "rh7", "lnbc", "m", 50_000, 10_000)
+            .await
+            .unwrap();
+
+        let a = bump_empty_listpays_sweeps(&pool, alice, "rh7").await.unwrap();
+        let b = bump_empty_listpays_sweeps(&pool, alice, "rh7").await.unwrap();
+        let c = bump_empty_listpays_sweeps(&pool, alice, "rh7").await.unwrap();
+        assert_eq!((a, b, c), (1, 2, 3));
+
+        reset_empty_listpays_sweeps(&pool, alice, "rh7")
+            .await
+            .unwrap();
+        let after_reset = bump_empty_listpays_sweeps(&pool, alice, "rh7")
+            .await
+            .unwrap();
+        assert_eq!(after_reset, 1, "reset should zero the counter");
+    }
+
+    #[tokio::test]
+    async fn bump_empty_listpays_no_op_on_finalized_row() {
+        // Once the row is no longer external_pending, the sweep counter
+        // should not advance. Otherwise a slow reconciler could mark a
+        // settled row "ready to refund".
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        seed_balance(&pool, alice, 100_000).await;
+        reserve_external_pay(&pool, alice, "rh8", "lnbc", "m", 50_000, 10_000)
+            .await
+            .unwrap();
+        settle_external_pay(&pool, alice, "rh8", "pre", 3_000, 10_000)
+            .await
+            .unwrap();
+
+        let n = bump_empty_listpays_sweeps(&pool, alice, "rh8").await.unwrap();
+        assert_eq!(n, 0, "settled row's sweep counter must stay at 0");
     }
 
     // ---------- onchain_credits::list_for_user ----------
@@ -1589,8 +1779,10 @@ mod tests {
         let (access, refresh) = tokens::create(&pool, alice).await.unwrap();
 
         // Backdate just past access TTL (7d). refresh (31d) still ok.
-        sqlx::query("UPDATE tokens SET created_at = created_at - (7*24*3600 + 60) WHERE access_token = ?")
-            .bind(&access)
+        // After migration 0008 the column is `access_token_hash` and
+        // the stored value is `sha256(access)` — match by hash.
+        sqlx::query("UPDATE tokens SET created_at = created_at - (7*24*3600 + 60) WHERE access_token_hash = ?")
+            .bind(tokens::hash_token(&access))
             .execute(&pool)
             .await
             .unwrap();
@@ -1606,8 +1798,8 @@ mod tests {
         );
 
         // Backdate further: 32 days total. Refresh now also expired.
-        sqlx::query("UPDATE tokens SET created_at = created_at - (25*24*3600) WHERE refresh_token = ?")
-            .bind(&refresh)
+        sqlx::query("UPDATE tokens SET created_at = created_at - (25*24*3600) WHERE refresh_token_hash = ?")
+            .bind(tokens::hash_token(&refresh))
             .execute(&pool)
             .await
             .unwrap();
@@ -1625,8 +1817,8 @@ mod tests {
         let (_, _) = tokens::create(&pool, alice).await.unwrap(); // fresh
 
         // Push old token's created_at past the 31-day refresh TTL.
-        sqlx::query("UPDATE tokens SET created_at = created_at - (32*24*3600) WHERE access_token = ?")
-            .bind(&access_old)
+        sqlx::query("UPDATE tokens SET created_at = created_at - (32*24*3600) WHERE access_token_hash = ?")
+            .bind(tokens::hash_token(&access_old))
             .execute(&pool)
             .await
             .unwrap();
@@ -1639,5 +1831,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 1, "fresh token must remain");
+    }
+
+    #[tokio::test]
+    async fn token_not_stored_in_plaintext() {
+        // Confirm migration 0008's hash-at-rest property: the raw
+        // bearer string must not appear in the DB; only its digest.
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        let (access, refresh) = tokens::create(&pool, alice).await.unwrap();
+
+        let row: (String, String) = sqlx::query_as(
+            "SELECT access_token_hash, refresh_token_hash FROM tokens WHERE user_id = ?",
+        )
+        .bind(alice)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_ne!(row.0, access, "DB must not store access plaintext");
+        assert_ne!(row.1, refresh, "DB must not store refresh plaintext");
+        assert_eq!(row.0, tokens::hash_token(&access));
+        assert_eq!(row.1, tokens::hash_token(&refresh));
     }
 }

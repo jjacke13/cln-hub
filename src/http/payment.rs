@@ -18,6 +18,12 @@ use crate::state::AppState;
 
 use super::{AppError, AuthUser};
 
+/// Hard cap on the inbound `invoice` field for /payinvoice and
+/// /decodeinvoice. Realistic BOLT11s are under 1 KB; 4 KB is plenty
+/// of headroom while keeping a single bad request from ramming
+/// megabytes into CLN's single-threaded unix-socket RPC.
+const MAX_BOLT11_LEN: usize = 4096;
+
 // =====================================================================
 // /payinvoice
 // =====================================================================
@@ -50,6 +56,17 @@ pub(super) async fn payinvoice(
     auth: AuthUser,
     Json(req): Json<PayInvoiceReq>,
 ) -> Result<Json<Value>, AppError> {
+    // ---- 0. Guard rails on the inbound BOLT11 string. ----
+    //
+    // Realistic BOLT11s are under 1 KB. We cap at 4 KB so a buggy or
+    // malicious client can't ship a 2 MB body straight into CLN's
+    // single-threaded RPC socket. Done BEFORE the decode round-trip
+    // so we never touch the unix socket with attacker-controlled
+    // megabytes.
+    if req.invoice.len() > MAX_BOLT11_LEN {
+        return Err(AppError::payment(7, "invoice too long"));
+    }
+
     // ---- 1. Decode the BOLT11 by asking CLN. ----
     let decoded = cln::call(
         &state.rpc_path,
@@ -81,7 +98,18 @@ pub(super) async fn payinvoice(
         .to_string();
 
     // ---- 2. Resolve amount: invoice's own, or override, or error. ----
-    let invoice_msat = decoded.get("amount_msat").and_then(|v| v.as_i64());
+    //
+    // CRITICAL: parse with `cln::parse_msat`, NOT `as_i64()`. CLN's
+    // wire format for `amount_msat` is integer in newer releases but
+    // the string `"<n>msat"` in older ones. A naive `as_i64()` returns
+    // None on the string form — the invoice is then treated as
+    // amountless, and the handler trusts the user-supplied `amount`
+    // field while CLN's `pay` is still called against the real
+    // BOLT11 amount. That's an overpayment / hub-drain bug.
+    let invoice_msat = decoded
+        .get("amount_msat")
+        .and_then(cln::parse_msat)
+        .map(|n| n as i64);
     let override_msat = parse_amount_sats_to_msat(&req.amount)?;
 
     let amount_msat = match (invoice_msat, override_msat) {
@@ -144,6 +172,12 @@ pub(super) async fn payinvoice(
 
         NotOurInvoice => {
             // Slice 5b: external Lightning payment via CLN `pay`.
+            //
+            // `invoice_is_amountless` decides whether we explicitly
+            // pass `amount_msat` to CLN's `pay`. CLN refuses the
+            // arg when the BOLT11 already encodes an amount, and
+            // requires it when amountless — so the boolean carries
+            // exactly the right information across the boundary.
             external_pay(
                 &state,
                 auth.user_id,
@@ -152,6 +186,7 @@ pub(super) async fn payinvoice(
                 &memo,
                 &destination,
                 amount_msat,
+                invoice_msat.is_none(),
             )
             .await
         }
@@ -185,6 +220,7 @@ fn is_in_flight_error(code: i64) -> bool {
     matches!(code, 200 | 210 | 211)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn external_pay(
     state: &Arc<AppState>,
     user_id: i64,
@@ -193,6 +229,7 @@ async fn external_pay(
     memo: &str,
     destination: &str,
     amount_msat: i64,
+    invoice_is_amountless: bool,
 ) -> Result<Json<Value>, AppError> {
     let fee_reserve_msat = compute_fee_reserve_msat(amount_msat);
 
@@ -236,14 +273,17 @@ async fn external_pay(
     // Default retry_for is 60s; we leave it at the default so any
     // error returned is terminal (or one of the in-flight codes we
     // explicitly recognise).
-    let pay_result = cln::call_strict(
-        &state.rpc_path,
-        "pay",
-        json!({
-            "bolt11": bolt11,
-        }),
-    )
-    .await;
+    //
+    // CLN's `pay` accepts `amount_msat` ONLY for amountless BOLT11s
+    // ("MUST NOT be supplied otherwise" per the spec). The handler
+    // tells us via `invoice_is_amountless`; we omit the field when
+    // the invoice carries its own amount so the call stays
+    // CLN-version-independent.
+    let mut pay_params = json!({"bolt11": bolt11});
+    if invoice_is_amountless {
+        pay_params["amount_msat"] = json!(amount_msat);
+    }
+    let pay_result = cln::call_strict(&state.rpc_path, "pay", pay_params).await;
 
     // ---- 3. Resolve (atomic settle or fail+refund). ----
     match pay_result {
@@ -259,7 +299,14 @@ async fn external_pay(
                 .unwrap_or(amount_msat);
             let actual_fee_msat = (sent_msat - amount_msat).max(0);
 
-            db::settle_external_pay(
+            // `settle_external_pay` returns Ok(false) when the row has
+            // already been finalized by the reconciler racing us — the
+            // reconciler polls `listpays` every 60s and may complete
+            // the row before our long-running `pay` call returns. Not
+            // an error: the money is already settled the way we wanted.
+            // We still return the success body to the client because we
+            // hold a valid preimage from CLN.
+            let newly_settled = db::settle_external_pay(
                 &state.db,
                 user_id,
                 payment_hash,
@@ -269,13 +316,20 @@ async fn external_pay(
             )
             .await?;
 
-            log::info!(
-                "external pay settled: user={} hash={} amount={}msat fee={}msat",
-                user_id,
-                payment_hash,
-                amount_msat,
-                actual_fee_msat
-            );
+            if newly_settled {
+                log::info!(
+                    "external pay settled: user={} hash={} amount={}msat fee={}msat",
+                    user_id,
+                    payment_hash,
+                    amount_msat,
+                    actual_fee_msat
+                );
+            } else {
+                log::info!(
+                    "external pay: handler settle no-op (already finalized by reconciler) user={} hash={}",
+                    user_id, payment_hash
+                );
+            }
 
             Ok(Json(payment_response(
                 destination,
@@ -309,7 +363,7 @@ async fn external_pay(
                 "external pay failed (code {}): user={} hash={} — refunding",
                 code, user_id, payment_hash
             );
-            db::fail_external_pay(
+            let newly_failed = db::fail_external_pay(
                 &state.db,
                 user_id,
                 payment_hash,
@@ -317,6 +371,12 @@ async fn external_pay(
                 fee_reserve_msat,
             )
             .await?;
+            if !newly_failed {
+                log::info!(
+                    "external pay: handler fail no-op (already finalized by reconciler) user={} hash={}",
+                    user_id, payment_hash
+                );
+            }
             Err(AppError::payment(
                 6,
                 format!("payment failed (CLN code {}: {})", code, message),

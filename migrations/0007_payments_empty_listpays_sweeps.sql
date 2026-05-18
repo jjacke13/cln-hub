@@ -1,0 +1,21 @@
+-- migrations/0007_payments_empty_listpays_sweeps.sql
+--
+-- Reconciler hardening. The /payinvoice reconciler used to refund a
+-- pending payment the moment CLN's `listpays` reported no record of
+-- the hash. That was unsafe: a transiently-empty `listpays` response
+-- (CLN restart in the middle of writing out the pay, a version-skew
+-- in the response schema, a brief socket hiccup, etc.) would have
+-- credited the user a refund for a payment that actually completed
+-- — net loss to the hub operator.
+--
+-- We now require the row to have been seen "empty" for several
+-- consecutive sweep cycles AND be older than a minimum age before
+-- the refund happens. The counter lives here; the policy (min count,
+-- min age) lives in src/plugin.rs so the constants are auditable
+-- alongside the code that enforces them.
+--
+-- Resets to 0 on any non-empty `listpays` sighting — i.e. we only
+-- consider sustained-empty streaks, not transient empty responses
+-- interleaved with real data.
+
+ALTER TABLE payments ADD COLUMN empty_listpays_sweeps INTEGER NOT NULL DEFAULT 0;
