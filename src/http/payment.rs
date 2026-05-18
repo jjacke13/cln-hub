@@ -564,24 +564,31 @@ pub(super) async fn gettxs(
     }
 
     for r in onchain {
+        // LndHub's bitcoind_tx canonical shape uses BTC (decimal
+        // float), NOT sats, in the `amount` field. Sending int sats
+        // here makes Zeus / BlueWallet render the entry as outgoing
+        // (their fallback for an unrecognised shape). Convert to BTC.
+        //
+        //   1 BTC = 100_000_000 sat = 100_000_000_000 msat
+        let amount_btc = r.amount_msat as f64 / 100_000_000_000.0;
         entries.push((
             r.credited_at,
             json!({
                 "type": "bitcoind_tx",
-                // LndHub clients read `amount` for on-chain entries
-                // (vs `value` for Lightning). Surface both for safety.
-                "amount": r.amount_msat / 1000,
-                "value": r.amount_msat / 1000,
-                "amount_msat": r.amount_msat,
-                "timestamp": r.credited_at,
-                "txid": r.txid,
-                "vout": r.vout,
-                "address": r.address,
-                "blockheight": r.blockheight,
+                "amount": amount_btc,            // BTC float, LndHub canonical
                 "category": "receive",
-                // Confirmation count would require a fresh
-                // bitcoind RPC per entry; left null for now.
-                "confirmations": Value::Null,
+                "confirmations": Value::Null,    // we don't track live counts
+                "address": r.address,
+                "txid": r.txid,
+                // `time` is the LndHub field name; `timestamp` retained
+                // for forward-compat with other clients.
+                "time": r.credited_at,
+                "timestamp": r.credited_at,
+                // Extras outside LndHub canon, useful for internal
+                // tooling. Stricter clients ignore unknown fields.
+                "amount_msat": r.amount_msat,
+                "vout": r.vout,
+                "blockheight": r.blockheight,
             }),
         ));
     }

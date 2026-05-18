@@ -201,7 +201,7 @@ All endpoints accept JSON. Errors return `{"error": true, "code": <int>, "messag
 - **Token rotation is additive.** Old tokens stay valid until TTL expires (matches original LndHub). No revoke-on-rotate.
 - **Rate-limit IP tracking is in-memory.** Restart resets state; map grows with distinct IPs ever seen (fine for LAN, add a pruner before public exposure).
 - **No per-login backoff** on `/auth` brute-force, only per-IP. Attacker rotating IPs (Tor / proxy pool) bypasses.
-- **`/gettxs` doesn't surface on-chain credits** — `onchain_in` ledger entries show up in `/getbalance` but not in any transaction list (mirrors original LndHub).
+- **`/gettxs` includes on-chain credits as `bitcoind_tx` entries** (LndHub canonical shape, `amount` in BTC float, `category: "receive"`). **Zeus** mis-renders these as outgoing because Zeus's source has no handling for the `bitcoind_tx` type — it treats every `/gettxs` entry as a payment. BlueWallet, which inherits the original LndHub conventions, is expected to render correctly (untested as of this writing). Accounting is unaffected; `/getbalance` includes the deposit regardless.
 
 ## Testing
 
