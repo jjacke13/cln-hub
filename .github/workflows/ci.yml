@@ -1,0 +1,58 @@
+# .github/workflows/ci.yml
+#
+# CI for cln-hub. Manual-trigger only (workflow_dispatch) so the
+# pipeline doesn't run on every push — saves runner minutes during
+# pre-alpha churn. To run: GitHub UI → Actions → CI → Run workflow,
+# or `gh workflow run ci.yml`.
+#
+# Matrix: one job per Linux architecture we ship in flake.nix.
+# Each job builds, lints (clippy with warnings as errors), and runs
+# the unit-test suite. Failures on either arch block "green".
+#
+# Why not also `nix build .#cln-hub`?
+#   It's slower (Nix re-fetches every crate), and the resulting
+#   binary is the same one cargo build produces under the dev shell.
+#   Validating the cargo path on each arch is enough for catching
+#   regressions; Nix-build validation happens on each developer's
+#   machine via the dev shell + `nix build .#cln-hub`.
+
+name: CI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            arch: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry, index, and target/
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build
+        run: cargo build --verbose
+
+      - name: cargo clippy (warnings = errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --verbose
