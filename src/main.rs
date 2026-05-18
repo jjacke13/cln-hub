@@ -32,7 +32,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use cln_plugin::{options::DefaultStringConfigOption, Builder};
+use cln_plugin::{
+    options::{DefaultIntegerConfigOption, DefaultStringConfigOption},
+    Builder,
+};
 
 use crate::http::ratelimit::RateLimiter;
 use crate::state::AppState;
@@ -55,6 +58,16 @@ const DB_OPTION: DefaultStringConfigOption = DefaultStringConfigOption::new_str_
      Defaults to <lightning-dir>/cln-hub.db.",
 );
 
+const MIN_DEPOSIT_CONFS_OPTION: DefaultIntegerConfigOption =
+    DefaultIntegerConfigOption::new_i64_with_default(
+        "cln-hub-min-deposit-confs",
+        2,
+        "Minimum confirmations before an on-chain deposit to a /getbtc \
+         address credits the user's ledger. Higher = safer (reorg-resistant), \
+         slower UX. Default 2 (typical LndHub-fork policy is 3; CLN's own \
+         'confirmed' is 1 confirmation).",
+    );
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // ---- Phase 1: declare + configure (read options) ----
@@ -67,6 +80,7 @@ async fn main() -> Result<()> {
     let configured = Builder::new(tokio::io::stdin(), tokio::io::stdout())
         .option(BIND_OPTION)
         .option(DB_OPTION)
+        .option(MIN_DEPOSIT_CONFS_OPTION)
         .subscribe("invoice_payment", plugin::invoice_payment)
         .dynamic()
         .configure()
@@ -79,6 +93,7 @@ async fn main() -> Result<()> {
     // ---- Read configuration ----
     let bind_str: String = configured.option(&BIND_OPTION)?;
     let db_str: String = configured.option(&DB_OPTION)?;
+    let min_deposit_confs: i64 = configured.option(&MIN_DEPOSIT_CONFS_OPTION)?;
 
     let conf = configured.configuration();
     let rpc_path = PathBuf::from(&conf.lightning_dir).join(&conf.rpc_file);
@@ -106,9 +121,15 @@ async fn main() -> Result<()> {
     // hand a copy each to: the HTTP router AND the plugin runtime.
     // Both share the SAME inner data — there's only one database
     // pool, one rpc_path, etc.
+    log::info!(
+        "cln-hub min on-chain deposit confs: {}",
+        min_deposit_confs
+    );
+
     let state = Arc::new(AppState {
         rpc_path,
         db: pool,
+        min_deposit_confs,
     });
 
     // Rate-limit buckets. Kept as standalone `Arc`s (rather than

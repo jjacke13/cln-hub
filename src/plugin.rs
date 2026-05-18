@@ -317,7 +317,21 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
 /// One pass of the watcher: enumerate outputs, credit any we haven't
 /// seen yet. Errors are propagated to `deposit_watcher`'s loop, which
 /// logs them and keeps going.
+///
+/// === Why we re-query the chain tip every pass ===
+///
+/// CLN's `listfunds` reports each UTXO's `blockheight` (where it
+/// landed) but NOT its current depth. To enforce
+/// `min_deposit_confs` we compare against the current tip from
+/// `getinfo`. One extra unix-socket round trip per scan;
+/// imperceptible cost.
 async fn scan_once(state: &AppState) -> Result<()> {
+    let info = cln::call(&state.rpc_path, "getinfo", json!({})).await?;
+    let tip = info
+        .get("blockheight")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
     let resp = cln::call(&state.rpc_path, "listfunds", json!({})).await?;
 
     let Some(outputs) = resp.get("outputs").and_then(|v| v.as_array()) else {
@@ -331,6 +345,20 @@ async fn scan_once(state: &AppState) -> Result<()> {
         // ledger credit but no real coins.
         let status = output.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if status != "confirmed" {
+            continue;
+        }
+
+        // Depth = tip - blockheight + 1 (inclusive).
+        // Skip until we have at least `min_deposit_confs`.
+        let blockheight = output.get("blockheight").and_then(|v| v.as_i64());
+        let depth = blockheight.map(|bh| tip - bh + 1).unwrap_or(0);
+        if depth < state.min_deposit_confs {
+            log::debug!(
+                "deposit watcher: skipping txid={:?} (depth {} < min {})",
+                output.get("txid").and_then(|v| v.as_str()),
+                depth,
+                state.min_deposit_confs
+            );
             continue;
         }
 

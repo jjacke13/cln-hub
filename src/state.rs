@@ -18,4 +18,13 @@ pub struct AppState {
     /// SQLite connection pool. `db::Pool` is `Arc`-internal, so
     /// we don't need another `Arc` layer around it.
     pub db: db::Pool,
+
+    /// Minimum on-chain confirmations before the deposit watcher
+    /// credits a UTXO to the owning user's ledger. Configured via
+    /// the `cln-hub-min-deposit-confs` plugin option (default 2).
+    ///
+    /// Setting this to 1 mirrors CLN's own "confirmed" semantics
+    /// (fast UX, exposed to single-block reorgs). Setting it to
+    /// 3+ matches typical LndHub-fork policy.
+    pub min_deposit_confs: i64,
 }
