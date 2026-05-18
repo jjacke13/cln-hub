@@ -33,3 +33,8 @@ flake.override.nix
 # logs, pidfiles). Configs live under examples/regtest/ which IS
 # tracked; this directory is where bitcoind/lightningd write at run.
 /.dev/
+
+# AI-assistant context file. Stays in working copy for the local
+# editor / Claude Code sessions, but does not belong in the public
+# repo (project-internal decisions, slice plans, working notes).
+/CLAUDE.md
