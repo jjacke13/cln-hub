@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use axum::{
     async_trait,
-    extract::{ConnectInfo, FromRequestParts, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Request, State},
     http::{request::Parts, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -119,6 +119,13 @@ pub fn router(
         // Request logger sits OUTSIDE `.with_state` so it logs every
         // request (including the 404s for routes we don't have yet).
         .layer(middleware::from_fn(log_request))
+        // Global request-body cap. axum's default is 2 MB which is
+        // wildly above what any LndHub-shaped JSON request needs
+        // (a few KB at worst). Tightening it to 64 KB removes a
+        // cheap memory-pressure amplifier from a misbehaving client.
+        // The /payinvoice + /decodeinvoice handlers separately
+        // bounds the inbound `invoice` string at 4 KB.
+        .layer(DefaultBodyLimit::max(64 * 1024))
         // Anything we *don't* explicitly route falls through to here.
         // We log the path so unknown clients tell us what they tried.
         .fallback(unknown_route)

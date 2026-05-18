@@ -279,7 +279,18 @@ async fn external_pay(
     // tells us via `invoice_is_amountless`; we omit the field when
     // the invoice carries its own amount so the call stays
     // CLN-version-independent.
-    let mut pay_params = json!({"bolt11": bolt11});
+    //
+    // `maxfee` binds CLN to spend at most our reserved fee buffer on
+    // routing. Without it, a CLN config that allows higher
+    // maxfeepercent (or a future default change) could spend a fee
+    // larger than what we debited from the user — the difference
+    // becomes a silent operator loss. With it, CLN refuses any route
+    // whose fee exceeds the buffer; the handler then takes the
+    // terminal-failure branch and the user is refunded cleanly.
+    let mut pay_params = json!({
+        "bolt11": bolt11,
+        "maxfee": fee_reserve_msat,
+    });
     if invoice_is_amountless {
         pay_params["amount_msat"] = json!(amount_msat);
     }
@@ -289,11 +300,20 @@ async fn external_pay(
     match pay_result {
         Ok(resp) => {
             // CLN pay returned terminal-success: a complete payment
-            // with preimage.
-            let preimage = resp["payment_preimage"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            // with preimage. The preimage is the off-chain
+            // proof-of-payment — refuse to settle on a malformed or
+            // empty one. Leaving the row pending makes the reconciler
+            // re-query `listpays` later, which often returns a
+            // canonical preimage even when the initial `pay` response
+            // was malformed.
+            let preimage = cln::validate_preimage(&resp["payment_preimage"]).ok_or_else(|| {
+                AppError::internal(anyhow::anyhow!(
+                    "CLN pay returned without a valid preimage for hash {} \
+                     (response: {:?}); leaving payment pending for reconciler retry",
+                    payment_hash,
+                    resp
+                ))
+            })?;
             let sent_msat = cln::parse_msat(&resp["amount_sent_msat"])
                 .map(|n| n as i64)
                 .unwrap_or(amount_msat);

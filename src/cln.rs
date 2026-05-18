@@ -194,3 +194,92 @@ pub fn parse_msat(v: &Value) -> Option<u64> {
     }
     None
 }
+
+/// Validate a CLN-returned `payment_preimage`. A preimage is the
+/// 32-byte secret whose SHA-256 equals the invoice's payment_hash;
+/// on the wire it's 64 lowercase hex characters. We refuse to settle
+/// an external payment with an absent / empty / malformed preimage —
+/// the preimage IS the off-chain receipt that lets a user prove they
+/// paid, and silently storing `""` for that field destroys an audit
+/// trail we may never recover.
+///
+/// Returns the validated preimage as an owned `String`, or `None` if
+/// the value is anything but a 64-char lowercase-hex string.
+pub fn validate_preimage(v: &Value) -> Option<String> {
+    let s = v.as_str()?;
+    if s.len() != 64 {
+        return None;
+    }
+    if !s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn validate_preimage_accepts_64_lowercase_hex() {
+        let v = json!("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            validate_preimage(&v).as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn validate_preimage_rejects_empty() {
+        assert!(validate_preimage(&json!("")).is_none());
+    }
+
+    #[test]
+    fn validate_preimage_rejects_wrong_length() {
+        assert!(validate_preimage(&json!("0123")).is_none());
+        // 63 chars
+        assert!(validate_preimage(&json!(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde"
+        ))
+        .is_none());
+        // 65 chars
+        assert!(validate_preimage(&json!(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn validate_preimage_rejects_uppercase() {
+        // 64 hex chars but uppercase. Be strict — CLN emits lowercase
+        // and accepting uppercase here would let mixed-case duplicates
+        // exist as different stored strings.
+        let v = json!("0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef");
+        assert!(validate_preimage(&v).is_none());
+    }
+
+    #[test]
+    fn validate_preimage_rejects_non_hex() {
+        // 64 chars, but contains 'g'.
+        let v = json!("g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        assert!(validate_preimage(&v).is_none());
+    }
+
+    #[test]
+    fn validate_preimage_rejects_non_string() {
+        assert!(validate_preimage(&json!(null)).is_none());
+        assert!(validate_preimage(&json!(123)).is_none());
+        assert!(validate_preimage(&json!(true)).is_none());
+        assert!(validate_preimage(&json!({})).is_none());
+    }
+
+    #[test]
+    fn parse_msat_accepts_known_shapes() {
+        assert_eq!(parse_msat(&json!(1000)), Some(1000));
+        assert_eq!(parse_msat(&json!("1000msat")), Some(1000));
+        assert_eq!(parse_msat(&json!("1000")), Some(1000));
+        assert_eq!(parse_msat(&json!(null)), None);
+        assert_eq!(parse_msat(&json!("garbage")), None);
+    }
+}

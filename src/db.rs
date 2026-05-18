@@ -53,7 +53,49 @@ pub async fn init(path: &Path) -> Result<Pool> {
     // ones. sqlx tracks them in an internal `_sqlx_migrations` table.
     sqlx::migrate!("./migrations").run(&pool).await?;
 
+    // Tighten file permissions on the DB. SQLite creates files with
+    // the process umask, typically 0644 — world-readable. The DB
+    // holds hashed (but still sensitive) credentials and the
+    // append-only ledger; nothing else on the host needs to read it.
+    // Best-effort: log on failure rather than abort, since on
+    // exotic filesystems the chmod may be unsupported. Same
+    // treatment for WAL / SHM sidecar files if they exist.
+    #[cfg(unix)]
+    secure_db_perms(path);
+
     Ok(pool)
+}
+
+/// Apply `0o600` (`rw-------`) permissions to the DB file and its
+/// SQLite-managed sidecar files (`.db-wal`, `.db-shm`). Logs at
+/// `warn` on failure but does not propagate the error — a missing
+/// chmod is a hardening miss, not a reason to refuse to serve.
+#[cfg(unix)]
+fn secure_db_perms(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let chmod = |p: &Path| {
+        if !p.exists() {
+            return;
+        }
+        match std::fs::metadata(p).and_then(|m| {
+            let mut perms = m.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(p, perms)
+        }) {
+            Ok(()) => {}
+            Err(e) => log::warn!("could not set 0600 on {:?}: {}", p, e),
+        }
+    };
+    chmod(path);
+    // sqlx's default journal mode is DELETE (no WAL files) but if
+    // anyone flips it on later, harden those too — and SQLite's
+    // rollback-journal `<db>-journal` lives in the same directory.
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = parent.join(format!("{}{}", file_name, suffix));
+        chmod(&sidecar);
+    }
 }
 
 // =====================================================================
@@ -1228,7 +1270,12 @@ pub fn random_hex(n: usize) -> String {
 
 /// Current unix epoch seconds. Wrapped here so every "now()" in the
 /// codebase agrees on one definition.
-fn unix_now() -> i64 {
+///
+/// `pub(crate)` so the startup clock-sanity check in `main.rs` can
+/// also call into this single source of truth — refusing to serve
+/// on a broken clock that returns 0 (which would otherwise reset
+/// every token's TTL math and let expired tokens pass).
+pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

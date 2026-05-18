@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use crate::cln;
 use crate::state::AppState;
 
-use super::AppError;
+use super::{AppError, AuthUser};
 
 // =====================================================================
 // /decodeinvoice
@@ -84,30 +84,52 @@ pub(super) async fn decodeinvoice(
 // /checkpayment/:hash
 // =====================================================================
 
-/// `GET /checkpayment/:hash` — has the invoice with this payment_hash
-/// (which we issued) been paid yet?
+/// `GET /checkpayment/:hash` — has THIS USER'S invoice with this
+/// payment_hash been paid yet?
 ///
 /// LndHub returns `{"paid": <bool>}`.
+///
+/// === Authentication ===
+///
+/// Authenticated and owner-scoped. The original LndHub left this
+/// endpoint open, which made it a free oracle: anyone with a valid
+/// payment_hash could probe whether it had settled on this hub. For
+/// a custodial Lightning service that's a privacy leak (an outside
+/// observer can correlate hashes they've sent to people with the
+/// hub's settlement timing). We require a bearer token and scope the
+/// lookup to invoices the caller owns. Hash that doesn't belong to
+/// this user → `{"paid": false}`, indistinguishable from "no such
+/// hash" — no oracle.
+///
+/// === Path validation ===
+///
+/// payment_hash is 32 bytes = 64 lowercase hex chars on the wire.
+/// Anything else is malformed input; reject before touching the DB.
 ///
 /// === Rust note: `Path<T>` ===
 ///
 /// `Path<String>` is axum's URL-parameter extractor. The `:hash`
 /// placeholder in the route declaration matches whatever's in the
 /// URL after `/checkpayment/`, and axum hands it to us as a `String`.
-/// `Path((a, b))` works for multi-segment routes like `/foo/:a/bar/:b`.
 pub(super) async fn checkpayment(
     State(state): State<Arc<AppState>>,
+    auth: AuthUser,
     Path(hash): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    // We re-use the by-label lookup helper would be wrong (label !=
-    // payment_hash). Inline the by-payment_hash query here — it's a
-    // single statement.
-    let row: Option<(Option<i64>,)> =
-        sqlx::query_as("SELECT settled_at FROM invoices WHERE payment_hash = ?")
-            .bind(&hash)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(AppError::internal)?;
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(AppError::bad_request(
+            "payment_hash must be 64 hex characters",
+        ));
+    }
+
+    let row: Option<(Option<i64>,)> = sqlx::query_as(
+        "SELECT settled_at FROM invoices WHERE payment_hash = ? AND user_id = ?",
+    )
+    .bind(&hash)
+    .bind(auth.user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(AppError::internal)?;
 
     let paid = row.and_then(|(s,)| s).is_some();
     Ok(Json(json!({ "paid": paid })))

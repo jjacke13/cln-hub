@@ -335,7 +335,20 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
 
     match status {
         "complete" => {
-            let preimage = last["preimage"].as_str().unwrap_or("").to_string();
+            // Validate preimage shape before settling. CLN's
+            // `listpays` historically reports the preimage on completed
+            // pays; a missing or malformed one is a CLN bug or
+            // version-skew. Leaving the row pending makes the
+            // reconciler retry on the next sweep — better than
+            // poisoning the payments row with an unusable receipt.
+            let Some(preimage) = cln::validate_preimage(&last["preimage"]) else {
+                log::warn!(
+                    "reconcile: hash={} listpays.complete missing/invalid preimage; \
+                     leaving pending for retry. raw last={:?}",
+                    p.payment_hash, last
+                );
+                return Ok(());
+            };
             let sent_msat = cln::parse_msat(&last["amount_sent_msat"])
                 .map(|n| n as i64)
                 .unwrap_or(p.amount_msat);

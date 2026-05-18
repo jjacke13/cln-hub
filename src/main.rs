@@ -61,15 +61,53 @@ const DB_OPTION: DefaultStringConfigOption = DefaultStringConfigOption::new_str_
 const MIN_DEPOSIT_CONFS_OPTION: DefaultIntegerConfigOption =
     DefaultIntegerConfigOption::new_i64_with_default(
         "cln-hub-min-deposit-confs",
-        2,
+        6,
         "Minimum confirmations before an on-chain deposit to a /getbtc \
-         address credits the user's ledger. Higher = safer (reorg-resistant), \
-         slower UX. Default 2 (typical LndHub-fork policy is 3; CLN's own \
-         'confirmed' is 1 confirmation).",
+         address credits the user's ledger. Default 6 — the typical \
+         exchange / custodial-Lightning industry threshold. Lower \
+         values reduce time-to-credit but increase exposure to \
+         shallow reorgs (1-2 block reorgs occur on mainnet occasionally; \
+         deeper reorgs are rarer but catastrophic for the operator). \
+         Values below 3 log a startup warning. Regtest harnesses \
+         routinely use 1-2 — that's fine, there's nothing to lose.",
     );
+
+/// Below this confirmation count, the operator gets a loud startup
+/// warning. The hub is still allowed to run — regtest, low-value
+/// experiment networks, and operator-deliberate low-confirm trade-offs
+/// are all legitimate uses. But mainnet operators should know what
+/// they signed up for if they drop below 3.
+const LOW_CONFS_WARN_THRESHOLD: i64 = 3;
+
+/// Lower bound on the system clock at startup. Below this and we
+/// refuse to serve, because everything else (token TTLs, invoice
+/// expiry, reconciler age-gates) depends on `unix_now()` returning
+/// a sane value. Set just below the start of 2024 so a misconfigured
+/// VM image / NTP-pending host fails closed instead of silently
+/// granting un-expirable tokens.
+const MIN_SANE_UNIX_TIME: i64 = 1_700_000_000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ---- Refuse to serve on a broken clock. ----
+    //
+    // If `SystemTime::now()` returns something earlier than
+    // ~late-2023, the host's clock hasn't been set / NTP hasn't run.
+    // Token TTLs would then be computed against an absurdly early
+    // epoch — tokens minted "now" would look prehistoric (negative
+    // ages), expiry checks would skew, and a later clock-adjust
+    // would invalidate every active session. Better to fail fast
+    // with a loud error so the operator notices.
+    let now = db::unix_now();
+    if now < MIN_SANE_UNIX_TIME {
+        anyhow::bail!(
+            "system clock looks broken (unix_now()={} < {}). \
+             Refusing to start — token TTL math is unsafe until NTP / RTC sync.",
+            now,
+            MIN_SANE_UNIX_TIME
+        );
+    }
+
     // ---- Phase 1: declare + configure (read options) ----
     //
     // `configure()` is the first half of the plugin init handshake:
@@ -125,6 +163,15 @@ async fn main() -> Result<()> {
         "cln-hub min on-chain deposit confs: {}",
         min_deposit_confs
     );
+    if min_deposit_confs < LOW_CONFS_WARN_THRESHOLD {
+        log::warn!(
+            "cln-hub-min-deposit-confs={} is below the recommended {} for custodial mainnet \
+             operation. Shallow on-chain reorgs can credit users for UTXOs that later vanish, \
+             draining the hub. Acceptable for regtest / experiment networks only.",
+            min_deposit_confs,
+            LOW_CONFS_WARN_THRESHOLD,
+        );
+    }
 
     let state = Arc::new(AppState {
         rpc_path,
