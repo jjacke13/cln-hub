@@ -28,3 +28,8 @@ flake.override.nix
 # `nix build` does).
 /result
 /result-*
+
+# Local regtest harness runtime state (bitcoind chain, CLN datadirs,
+# logs, pidfiles). Configs live under examples/regtest/ which IS
+# tracked; this directory is where bitcoind/lightningd write at run.
+/.dev/
