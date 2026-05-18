@@ -10,17 +10,17 @@ The same REST surface that BlueWallet, Zeus, and other LndHub clients already sp
 
 ## Status
 
-Pre-alpha but functional. Verified against Zeus on plain HTTP. The internal-payment ledger and token machinery have end-to-end tests; the external Lightning payment path is stubbed pending a node with channels (see [Roadmap](#roadmap)).
+Pre-alpha but functional. Verified against Zeus on plain HTTP, plus 20 unit tests covering every atomic database path and an end-to-end regtest harness that exercises the full external Lightning payment + on-chain deposit flows.
 
 ## Features
 
-- **LndHub-compatible REST API** — drop-in replacement for the BlueWallet LndHub server. See [API reference](#api-reference) below.
+- **Full LndHub-compatible REST API** — drop-in replacement for the BlueWallet LndHub server. See [API reference](#api-reference) below.
 - **Custodial accounts** — random `login`/`password` per `/create`, opaque `access_token`/`refresh_token` pair per `/auth`. Argon2id password hashing.
 - **Internal payments** — when a hub user pays another hub user's invoice, the whole settlement is one atomic SQLite transaction. No fee, no Lightning traffic.
-- **External payments (planned)** — wired to the same `/payinvoice` endpoint; currently returns `code 6 "external payments are not yet wired"` until channels exist.
-- **On-chain deposits** — `/getbtc` mints a fresh CLN bech32 address per user; a background watcher polls `listfunds` and credits the user's ledger when deposits confirm.
+- **External Lightning payments** — `/payinvoice` reserves balance + fee, calls CLN `pay`, then settles or refunds atomically. Distinguishes terminal failure from in-flight CLN error codes (200/210/211). Background reconciler resolves crash-mid-pay state via `listpays`.
+- **On-chain deposits** — `/getbtc` mints a fresh CLN bech32 address per user; a background watcher polls `listfunds` and credits the user's ledger when deposits confirm. Idempotent by `(txid, vout)`.
 - **Token TTL + cleanup** — access tokens expire after 7 days, refresh tokens after 31 days. An hourly background task prunes expired rows.
-- **Per-IP rate limiting** — token-bucket on `/create` and `/auth`. No new crates; ~30-line implementation.
+- **Per-IP rate limiting** — token-bucket on `/create` and `/auth`. Hand-rolled, no new crates.
 - **Single Nix-built binary** — ~5.8 MB, statically linked SQLite, glibc-only.
 
 ## Quick start
@@ -185,25 +185,37 @@ All endpoints accept JSON. Errors return `{"error": true, "code": <int>, "messag
 | 3 | ✅ | SQLite users + `/create` + `/auth` (argon2id, opaque tokens) |
 | 4 | ✅ | `/addinvoice` + `invoice_payment` notification → atomic credit |
 | 5a | ✅ | `/payinvoice` internal short-circuit, `/getbalance`, `/gettxs`, `/decodeinvoice`, `/checkpayment` |
-| 5b | ⏳ | External `/payinvoice` (CLN `pay`) — needs channels |
+| 5b | ✅ | External `/payinvoice` (CLN `pay`) — reserve/refund + reconciler |
 | 5c | ✅ | Token TTL + per-IP rate limiting |
 | 5d | ✅ | Hourly token cleanup + `/getbtc` |
 | 5e | ✅ | On-chain deposit watcher (`listfunds` → `ledger`) |
-| — | 📋 | NixOS module (`services.cln-hub.enable = true`) |
+| 6 | ✅ | Regtest harness (`examples/regtest/`) — bitcoind + 2 CLN nodes |
+| — | ✅ | 20 unit tests for db.rs atomic functions |
 | — | 📋 | TLS / reverse-proxy story for non-LAN exposure |
-| — | 📋 | Real wallet client compat polish (Buffer-style `r_hash`, etc.) |
+| — | 📋 | GitHub Actions CI (build + clippy + test on PRs) |
 
 ## Known limitations
 
 - **No HTTPS.** Bind to localhost; for non-LAN exposure put Caddy/nginx in front.
-- **External Lightning payments (`/payinvoice` to non-hub invoices) return `code 6`.** Slice 5b will wire CLN's `pay` once we have channels to test against.
+- **External payment liquidity** depends on the operator's CLN channels. `/payinvoice` returns `code 6 "destination unreachable"` when no route exists. Operators must keep outbound capacity ≥ sum of user balances to avoid stranded credit.
 - **Token rotation is additive.** Old tokens stay valid until TTL expires (matches original LndHub). No revoke-on-rotate.
 - **Rate-limit IP tracking is in-memory.** Restart resets state; map grows with distinct IPs ever seen (fine for LAN, add a pruner before public exposure).
 - **No per-login backoff** on `/auth` brute-force, only per-IP. Attacker rotating IPs (Tor / proxy pool) bypasses.
+- **`/gettxs` doesn't surface on-chain credits** — `onchain_in` ledger entries show up in `/getbalance` but not in any transaction list (mirrors original LndHub).
 
-## Testing manually
+## Testing
 
-The project has no automated test suite yet (TODO). Manual end-to-end test commands live in the slice notes — see git log for `feat:` commits, each ships with a verification recipe.
+### Unit tests
+
+```sh
+cargo test
+```
+
+20 tests against an in-memory SQLite, covering every atomic database path: user create/verify, balance arithmetic, `try_settle_internal` (all five outcomes), `reserve/settle/fail_external_pay` including the unified-index concurrency guard, `credit_onchain` idempotency, `settle_invoice` idempotency, and token TTL + cleanup. Runs in ~5 seconds.
+
+### Regtest end-to-end
+
+A complete bitcoind + 2-CLN-node harness lives under [`examples/regtest/`](examples/regtest/). Boots in ~10 seconds, opens a real channel between the two nodes, and lets you load `cln-hub` against one of them for full external-pay + on-chain deposit testing. See [examples/regtest/README.md](examples/regtest/README.md) for recipes.
 
 ## License
 
