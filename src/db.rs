@@ -1081,3 +1081,472 @@ fn unix_now() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default()
 }
+
+// =====================================================================
+// Tests
+// =====================================================================
+//
+// Unit tests for every atomic / safety-critical function in this
+// module. Each test gets a fresh in-memory SQLite database with
+// migrations applied, so there's no cross-test contamination and no
+// filesystem state to clean up.
+//
+// === Rust note: `#[cfg(test)]` ===
+//
+// The whole module is gated on `cfg(test)`, meaning the compiler
+// only compiles it when running `cargo test`. Zero overhead on
+// release builds.
+//
+// === Rust note: `#[tokio::test]` ===
+//
+// Like `#[tokio::main]` for tests — sets up a tokio runtime for
+// each test so we can use `await` inside the test body.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    /// Build a fresh in-memory SQLite pool with migrations applied.
+    ///
+    /// `max_connections=1` is important: the in-memory database
+    /// lives inside a single connection's address space. A pool
+    /// with multiple connections would see each as a separate
+    /// empty DB, which would defeat the migration setup.
+    async fn fresh_pool() -> Pool {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("create in-memory pool");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    async fn make_user(pool: &Pool, login: &str) -> i64 {
+        users::create(pool, login, "pw").await.unwrap()
+    }
+
+    /// Direct ledger insert to set up balance for spend-path tests.
+    /// Bypasses every business-logic check — that's the point: we
+    /// want to drive the path under test, not the seed mechanism.
+    async fn seed_balance(pool: &Pool, user_id: i64, amount_msat: i64) {
+        sqlx::query(
+            "INSERT INTO ledger (user_id, kind, amount_msat, ref_hash, description, created_at) \
+             VALUES (?, 'seed', ?, NULL, 'test seed', ?)",
+        )
+        .bind(user_id)
+        .bind(amount_msat)
+        .bind(unix_now())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn make_invoice(pool: &Pool, owner_id: i64, payment_hash: &str, amount_msat: i64) {
+        invoices::create(
+            pool,
+            payment_hash,
+            &format!("test-{}", payment_hash),
+            owner_id,
+            amount_msat,
+            "memo",
+            "lnbc-test",
+            unix_now() + 3600,
+        )
+        .await
+        .unwrap();
+    }
+
+    // ---------- users ----------
+
+    #[tokio::test]
+    async fn users_create_and_verify_round_trip() {
+        let pool = fresh_pool().await;
+        let id = users::create(&pool, "alice", "s3cret").await.unwrap();
+        assert!(id > 0);
+        assert_eq!(
+            users::verify(&pool, "alice", "s3cret").await.unwrap(),
+            Some(id),
+            "correct password should match"
+        );
+        assert_eq!(
+            users::verify(&pool, "alice", "WRONG").await.unwrap(),
+            None,
+            "wrong password should fail"
+        );
+        assert_eq!(
+            users::verify(&pool, "bob", "s3cret").await.unwrap(),
+            None,
+            "unknown login should fail"
+        );
+    }
+
+    // ---------- balance ----------
+
+    #[tokio::test]
+    async fn balance_zero_for_new_user() {
+        let pool = fresh_pool().await;
+        let id = make_user(&pool, "alice").await;
+        assert_eq!(balance_msat(&pool, id).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn balance_sums_ledger_entries() {
+        let pool = fresh_pool().await;
+        let id = make_user(&pool, "alice").await;
+        seed_balance(&pool, id, 100_000).await;
+        seed_balance(&pool, id, 50_000).await;
+        seed_balance(&pool, id, -30_000).await;
+        assert_eq!(balance_msat(&pool, id).await.unwrap(), 120_000);
+    }
+
+    // ---------- try_settle_internal ----------
+
+    #[tokio::test]
+    async fn internal_pay_success() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        let bob = make_user(&pool, "bob").await;
+        seed_balance(&pool, alice, 100_000).await;
+        make_invoice(&pool, bob, "h1", 30_000).await;
+
+        let result = try_settle_internal(&pool, alice, "h1", "lnbc", 30_000, "memo")
+            .await
+            .unwrap();
+        match result {
+            InternalPayResult::Settled { receiver_user_id } => assert_eq!(receiver_user_id, bob),
+            _ => panic!("expected Settled"),
+        }
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 70_000);
+        assert_eq!(balance_msat(&pool, bob).await.unwrap(), 30_000);
+    }
+
+    #[tokio::test]
+    async fn internal_pay_not_our_invoice() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        seed_balance(&pool, alice, 100_000).await;
+        // No invoice exists for this hash.
+        let result = try_settle_internal(&pool, alice, "stranger", "lnbc", 10_000, "m")
+            .await
+            .unwrap();
+        assert!(matches!(result, InternalPayResult::NotOurInvoice));
+        // Balance untouched.
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn internal_pay_already_paid() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        let bob = make_user(&pool, "bob").await;
+        seed_balance(&pool, alice, 100_000).await;
+        make_invoice(&pool, bob, "h2", 30_000).await;
+        // First pay settles.
+        try_settle_internal(&pool, alice, "h2", "lnbc", 30_000, "m")
+            .await
+            .unwrap();
+        // Second attempt sees settled invoice.
+        let result = try_settle_internal(&pool, alice, "h2", "lnbc", 30_000, "m")
+            .await
+            .unwrap();
+        assert!(matches!(result, InternalPayResult::AlreadyPaid));
+        // No additional movement.
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 70_000);
+        assert_eq!(balance_msat(&pool, bob).await.unwrap(), 30_000);
+    }
+
+    #[tokio::test]
+    async fn internal_pay_self_payment_refused() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        seed_balance(&pool, alice, 100_000).await;
+        make_invoice(&pool, alice, "h3", 10_000).await;
+        let result = try_settle_internal(&pool, alice, "h3", "lnbc", 10_000, "m")
+            .await
+            .unwrap();
+        assert!(matches!(result, InternalPayResult::SelfPayment));
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn internal_pay_insufficient_balance() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        let bob = make_user(&pool, "bob").await;
+        seed_balance(&pool, alice, 5_000).await;
+        make_invoice(&pool, bob, "h4", 30_000).await;
+        let result = try_settle_internal(&pool, alice, "h4", "lnbc", 30_000, "m")
+            .await
+            .unwrap();
+        match result {
+            InternalPayResult::InsufficientBalance { balance_msat: bal, .. } => {
+                assert_eq!(bal, 5_000)
+            }
+            _ => panic!("expected InsufficientBalance"),
+        }
+        // Both balances untouched.
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 5_000);
+        assert_eq!(balance_msat(&pool, bob).await.unwrap(), 0);
+    }
+
+    // ---------- reserve / settle / fail external pay ----------
+
+    #[tokio::test]
+    async fn reserve_external_success() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        seed_balance(&pool, alice, 100_000).await;
+        let result = reserve_external_pay(&pool, alice, "rh1", "lnbc", "m", 50_000, 1_000)
+            .await
+            .unwrap();
+        assert!(matches!(result, ReserveResult::Reserved));
+        // Reserve debited amount + fee_reserve.
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 49_000);
+    }
+
+    #[tokio::test]
+    async fn reserve_external_insufficient() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        seed_balance(&pool, alice, 10_000).await;
+        let result = reserve_external_pay(&pool, alice, "rh2", "lnbc", "m", 50_000, 1_000)
+            .await
+            .unwrap();
+        match result {
+            ReserveResult::InsufficientBalance {
+                balance_msat: b,
+                required_msat: r,
+            } => {
+                assert_eq!(b, 10_000);
+                assert_eq!(r, 51_000);
+            }
+            _ => panic!("expected InsufficientBalance"),
+        }
+        // No movement on rejected reserve.
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 10_000);
+    }
+
+    #[tokio::test]
+    async fn reserve_external_duplicate_rejected_by_unified_index() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        seed_balance(&pool, alice, 200_000).await;
+        // First reserve goes through.
+        reserve_external_pay(&pool, alice, "rh3", "lnbc", "m", 50_000, 1_000)
+            .await
+            .unwrap();
+        // Second reserve for same (user, hash) trips the unified
+        // partial UNIQUE index from migration 0006.
+        let result = reserve_external_pay(&pool, alice, "rh3", "lnbc", "m", 50_000, 1_000)
+            .await
+            .unwrap();
+        assert!(matches!(result, ReserveResult::AlreadyAttempted));
+        // Only the first reserve's debit landed.
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 149_000);
+    }
+
+    #[tokio::test]
+    async fn settle_external_refunds_unused_reserve() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        seed_balance(&pool, alice, 100_000).await;
+        reserve_external_pay(&pool, alice, "rh4", "lnbc", "m", 50_000, 10_000)
+            .await
+            .unwrap();
+        // After reserve: 100k - (50k + 10k) = 40k.
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 40_000);
+
+        settle_external_pay(&pool, alice, "rh4", "preimage_hex", 3_000, 10_000)
+            .await
+            .unwrap();
+        // 7k of 10k reserve refunded → 40k + 7k = 47k.
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 47_000);
+    }
+
+    #[tokio::test]
+    async fn settle_external_no_refund_when_reserve_exhausted() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        seed_balance(&pool, alice, 100_000).await;
+        reserve_external_pay(&pool, alice, "rh5", "lnbc", "m", 50_000, 10_000)
+            .await
+            .unwrap();
+        settle_external_pay(&pool, alice, "rh5", "preimage", 10_000, 10_000)
+            .await
+            .unwrap();
+        // 10k reserve all consumed by fees → no refund. 40k stands.
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 40_000);
+    }
+
+    #[tokio::test]
+    async fn fail_external_refunds_full_reserve() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        seed_balance(&pool, alice, 100_000).await;
+        reserve_external_pay(&pool, alice, "rh6", "lnbc", "m", 50_000, 10_000)
+            .await
+            .unwrap();
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 40_000);
+
+        fail_external_pay(&pool, alice, "rh6", 50_000, 10_000)
+            .await
+            .unwrap();
+        // Full refund: 100k restored.
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 100_000);
+    }
+
+    // ---------- credit_onchain ----------
+
+    #[tokio::test]
+    async fn credit_onchain_basic_and_idempotent() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        // FK on onchain_credits.user_id requires the user; address
+        // FK is implicit through application logic, not SQL.
+        addresses::create(&pool, alice, "bc1qtest").await.unwrap();
+
+        // First credit lands.
+        let first = credit_onchain(&pool, "tx-aaa", 0, alice, "bc1qtest", 100_000, Some(150))
+            .await
+            .unwrap();
+        assert!(first);
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 100_000);
+
+        // Same (txid, vout) — should be a no-op.
+        let second = credit_onchain(&pool, "tx-aaa", 0, alice, "bc1qtest", 100_000, Some(150))
+            .await
+            .unwrap();
+        assert!(!second);
+        assert_eq!(
+            balance_msat(&pool, alice).await.unwrap(),
+            100_000,
+            "balance must not double on replay"
+        );
+
+        // Different vout of same tx — distinct UTXO, should credit.
+        let third = credit_onchain(&pool, "tx-aaa", 1, alice, "bc1qtest", 50_000, Some(150))
+            .await
+            .unwrap();
+        assert!(third);
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 150_000);
+    }
+
+    // ---------- settle_invoice (slice 4 credit-on-settle) ----------
+
+    #[tokio::test]
+    async fn settle_invoice_idempotent() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        make_invoice(&pool, alice, "inv1", 50_000).await;
+
+        let first = settle_invoice(&pool, "inv1", 50_000).await.unwrap();
+        assert!(first);
+        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 50_000);
+
+        let second = settle_invoice(&pool, "inv1", 50_000).await.unwrap();
+        assert!(!second);
+        assert_eq!(
+            balance_msat(&pool, alice).await.unwrap(),
+            50_000,
+            "duplicate notification must not double-credit"
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_invoice_unknown_hash_is_noop() {
+        let pool = fresh_pool().await;
+        let credited = settle_invoice(&pool, "nope", 1_000).await.unwrap();
+        assert!(!credited);
+    }
+
+    // ---------- token TTL + cleanup ----------
+
+    #[tokio::test]
+    async fn token_create_and_lookup() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        let (access, refresh) = tokens::create(&pool, alice).await.unwrap();
+
+        assert_eq!(
+            tokens::user_id_for_access(&pool, &access).await.unwrap(),
+            Some(alice)
+        );
+        assert_eq!(
+            tokens::user_id_for_refresh(&pool, &refresh).await.unwrap(),
+            Some(alice)
+        );
+        assert_eq!(
+            tokens::user_id_for_access(&pool, "bogus").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn token_ttl_filters_at_lookup() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        let (access, refresh) = tokens::create(&pool, alice).await.unwrap();
+
+        // Backdate just past access TTL (7d). refresh (31d) still ok.
+        sqlx::query("UPDATE tokens SET created_at = created_at - (7*24*3600 + 60) WHERE access_token = ?")
+            .bind(&access)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokens::user_id_for_access(&pool, &access).await.unwrap(),
+            None,
+            "expired access should not authenticate"
+        );
+        assert_eq!(
+            tokens::user_id_for_refresh(&pool, &refresh).await.unwrap(),
+            Some(alice),
+            "refresh still valid 7 days in"
+        );
+
+        // Backdate further: 32 days total. Refresh now also expired.
+        sqlx::query("UPDATE tokens SET created_at = created_at - (25*24*3600) WHERE refresh_token = ?")
+            .bind(&refresh)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokens::user_id_for_refresh(&pool, &refresh).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn token_cleanup_removes_only_post_refresh_ttl() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        let (access_old, _) = tokens::create(&pool, alice).await.unwrap();
+        let (_, _) = tokens::create(&pool, alice).await.unwrap(); // fresh
+
+        // Push old token's created_at past the 31-day refresh TTL.
+        sqlx::query("UPDATE tokens SET created_at = created_at - (32*24*3600) WHERE access_token = ?")
+            .bind(&access_old)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let removed = tokens::cleanup_expired(&pool).await.unwrap();
+        assert_eq!(removed, 1);
+
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tokens")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 1, "fresh token must remain");
+    }
+}
