@@ -515,17 +515,37 @@ pub(super) async fn getbtc(
 // /gettxs
 // =====================================================================
 
-/// `GET /gettxs` — outbound payment history (LndHub semantics:
-/// /getuserinvoices for incoming, /gettxs for outgoing).
+/// `GET /gettxs` — combined transaction history.
+///
+/// LndHub returns a single mixed-type list, discriminated by the
+/// `"type"` field on each entry. Two kinds appear today:
+///
+///   - `type: "paid_invoice"` — outbound Lightning payments (from
+///     `db::payments`). Shape unchanged from slice 5; existing
+///     clients that already render these keep working untouched.
+///
+///   - `type: "bitcoind_tx"` — confirmed on-chain deposits (from
+///     `db::onchain_credits`). Newly added in slice I. Clients that
+///     don't recognise this type can safely skip; clients that do
+///     show on-chain receives alongside Lightning payments.
+///
+/// Sorted newest-first by entry timestamp. Sort happens after the
+/// two queries — neither table sees the other.
 pub(super) async fn gettxs(
     State(state): State<Arc<AppState>>,
     auth: AuthUser,
 ) -> Result<Json<Value>, AppError> {
-    let rows = db::payments::list_for_user(&state.db, auth.user_id).await?;
+    let payments = db::payments::list_for_user(&state.db, auth.user_id).await?;
+    let onchain = db::onchain_credits::list_for_user(&state.db, auth.user_id).await?;
 
-    let arr: Vec<Value> = rows
-        .into_iter()
-        .map(|r| {
+    // Each entry carries its own timestamp; collect (ts, json) so we
+    // can sort the merged list without re-extracting after the fact.
+    let mut entries: Vec<(i64, Value)> =
+        Vec::with_capacity(payments.len() + onchain.len());
+
+    for r in payments {
+        entries.push((
+            r.created_at,
             json!({
                 "type": "paid_invoice",
                 "fee": r.fee_msat / 1000,
@@ -539,9 +559,36 @@ pub(super) async fn gettxs(
                 "payment_request": r.bolt11,
                 "status": r.status,
                 "settled_at": r.settled_at,
-            })
-        })
-        .collect();
+            }),
+        ));
+    }
 
+    for r in onchain {
+        entries.push((
+            r.credited_at,
+            json!({
+                "type": "bitcoind_tx",
+                // LndHub clients read `amount` for on-chain entries
+                // (vs `value` for Lightning). Surface both for safety.
+                "amount": r.amount_msat / 1000,
+                "value": r.amount_msat / 1000,
+                "amount_msat": r.amount_msat,
+                "timestamp": r.credited_at,
+                "txid": r.txid,
+                "vout": r.vout,
+                "address": r.address,
+                "blockheight": r.blockheight,
+                "category": "receive",
+                // Confirmation count would require a fresh
+                // bitcoind RPC per entry; left null for now.
+                "confirmations": Value::Null,
+            }),
+        ));
+    }
+
+    // Newest first. `Reverse` gives descending sort with `sort_by_key`.
+    entries.sort_by_key(|e| std::cmp::Reverse(e.0));
+
+    let arr: Vec<Value> = entries.into_iter().map(|(_, v)| v).collect();
     Ok(Json(Value::Array(arr)))
 }

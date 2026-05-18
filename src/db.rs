@@ -453,6 +453,60 @@ pub mod addresses {
 }
 
 // =====================================================================
+// onchain_credits (read-side helper)
+// =====================================================================
+
+/// Read-side helpers for the `onchain_credits` table. Writes happen
+/// in `credit_onchain` (atomic with the ledger row) — there is no
+/// public mutator here.
+pub mod onchain_credits {
+    use super::{Pool, Result};
+
+    /// `#[allow(dead_code)]` because callers currently only read a
+    /// subset of fields; the rest are loaded for symmetry / future
+    /// diagnostics.
+    #[allow(dead_code)]
+    pub struct Row {
+        pub txid: String,
+        pub vout: i64,
+        pub user_id: i64,
+        pub address: String,
+        pub amount_msat: i64,
+        pub blockheight: Option<i64>,
+        pub credited_at: i64,
+    }
+
+    /// Tuple shape of one row, matching `SELECT_COLS` below. Aliased
+    /// so the sqlx generic doesn't bloat the function signature
+    /// (matches the pattern used by the other modules in this file).
+    type RowTuple = (String, i64, i64, String, i64, Option<i64>, i64);
+
+    fn from_tuple(t: RowTuple) -> Row {
+        Row {
+            txid: t.0,
+            vout: t.1,
+            user_id: t.2,
+            address: t.3,
+            amount_msat: t.4,
+            blockheight: t.5,
+            credited_at: t.6,
+        }
+    }
+
+    const SELECT_COLS: &str =
+        "txid, vout, user_id, address, amount_msat, blockheight, credited_at";
+
+    /// List one user's confirmed on-chain credits, newest first.
+    pub async fn list_for_user(pool: &Pool, user_id: i64) -> Result<Vec<Row>> {
+        let q = format!(
+            "SELECT {SELECT_COLS} FROM onchain_credits WHERE user_id = ? ORDER BY credited_at DESC"
+        );
+        let rows: Vec<RowTuple> = sqlx::query_as(&q).bind(user_id).fetch_all(pool).await?;
+        Ok(rows.into_iter().map(from_tuple).collect())
+    }
+}
+
+// =====================================================================
 // Balance
 // =====================================================================
 
@@ -1403,6 +1457,43 @@ mod tests {
             .unwrap();
         // Full refund: 100k restored.
         assert_eq!(balance_msat(&pool, alice).await.unwrap(), 100_000);
+    }
+
+    // ---------- onchain_credits::list_for_user ----------
+
+    #[tokio::test]
+    async fn onchain_credits_list_for_user_orders_newest_first() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        addresses::create(&pool, alice, "bc1qfake").await.unwrap();
+
+        // Three rows with hand-stamped credited_at so the sort is
+        // deterministic regardless of test-run timing.
+        sqlx::query(
+            "INSERT INTO onchain_credits (txid, vout, user_id, address, amount_msat, blockheight, credited_at) \
+             VALUES ('aaa', 0, ?, 'bc1qfake', 100, NULL, 1000), \
+                    ('bbb', 0, ?, 'bc1qfake', 200, NULL, 2000), \
+                    ('ccc', 0, ?, 'bc1qfake', 300, NULL, 1500);",
+        )
+        .bind(alice)
+        .bind(alice)
+        .bind(alice)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows = onchain_credits::list_for_user(&pool, alice).await.unwrap();
+        let order: Vec<&str> = rows.iter().map(|r| r.txid.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["bbb", "ccc", "aaa"],
+            "list_for_user should sort by credited_at DESC"
+        );
+
+        // Other user sees their own (empty) list.
+        let bob = make_user(&pool, "bob").await;
+        let bob_rows = onchain_credits::list_for_user(&pool, bob).await.unwrap();
+        assert!(bob_rows.is_empty());
     }
 
     // ---------- credit_onchain ----------
