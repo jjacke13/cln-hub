@@ -638,6 +638,290 @@ pub async fn try_settle_internal(
 }
 
 // =====================================================================
+// External Lightning payment (slice 5b)
+// =====================================================================
+
+/// Outcome of `reserve_external_pay`.
+///
+/// The function is non-fallible at the business-logic level — every
+/// scenario (success, low balance, in-progress duplicate) has a
+/// dedicated variant — so the HTTP handler can map each cleanly to
+/// the matching LndHub error code. Database / SQLite failures still
+/// bubble up via the outer `Result`.
+pub enum ReserveResult {
+    /// Reserved successfully. Caller MUST eventually finalize via
+    /// `settle_external_pay` or `fail_external_pay`.
+    Reserved,
+    /// Balance check failed inside the reserve transaction.
+    InsufficientBalance {
+        balance_msat: i64,
+        required_msat: i64,
+    },
+    /// A row for this (user, payment_hash) already exists in
+    /// 'external_pending' or terminal state. Refuse a second attempt.
+    AlreadyAttempted,
+}
+
+/// Reserve funds for an external (CLN `pay`) Lightning payment.
+///
+/// In one atomic SQLite transaction:
+///   1. Check the user's balance covers `amount_msat + fee_reserve_msat`.
+///   2. Insert a `payments` row with status `external_pending`. The
+///      partial UNIQUE index from migration 0006 forbids two
+///      concurrent pendings for the same (user, hash).
+///   3. Debit the ledger by the full reserved total.
+///
+/// Why reserve a fee *upfront* (rather than debiting only the actual
+/// fee after pay succeeds)? Because a custodial user must not be
+/// allowed to spend right up to their balance and then have a route
+/// fee push them negative. We over-reserve, then refund the unused
+/// portion in `settle_external_pay`.
+///
+/// Returns the matching `ReserveResult` variant — the HTTP handler
+/// branches on it.
+#[allow(clippy::too_many_arguments)]
+pub async fn reserve_external_pay(
+    pool: &Pool,
+    user_id: i64,
+    payment_hash: &str,
+    bolt11: &str,
+    memo: &str,
+    amount_msat: i64,
+    fee_reserve_msat: i64,
+) -> Result<ReserveResult> {
+    let mut tx = pool.begin().await?;
+    let now = unix_now();
+    let total = amount_msat + fee_reserve_msat;
+
+    // (1) Balance check INSIDE the tx — without this, two concurrent
+    //     reserves could each pass and we'd overdraft.
+    let (balance,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(amount_msat), 0) FROM ledger WHERE user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if balance < total {
+        tx.rollback().await?;
+        return Ok(ReserveResult::InsufficientBalance {
+            balance_msat: balance,
+            required_msat: total,
+        });
+    }
+
+    // (2) Insert pending row. We store `fee_reserve_msat` in the
+    //     `fee_msat` column temporarily — `settle_external_pay`
+    //     overwrites with the actual fee on success.
+    let insert = sqlx::query(
+        "INSERT INTO payments \
+            (payment_hash, user_id, bolt11, amount_msat, fee_msat, preimage, status, memo, created_at, settled_at) \
+         VALUES (?, ?, ?, ?, ?, NULL, 'external_pending', ?, ?, NULL)",
+    )
+    .bind(payment_hash)
+    .bind(user_id)
+    .bind(bolt11)
+    .bind(amount_msat)
+    .bind(fee_reserve_msat)
+    .bind(memo)
+    .bind(now)
+    .execute(&mut *tx)
+    .await;
+
+    match insert {
+        Ok(_) => {}
+        // The partial UNIQUE index from migration 0003 / 0006 means
+        // this row already exists in some state (pending or settled).
+        // `dbe.is_unique_violation()` is sqlx's portable way to
+        // recognise this across drivers.
+        Err(sqlx::Error::Database(dbe)) if dbe.is_unique_violation() => {
+            tx.rollback().await?;
+            return Ok(ReserveResult::AlreadyAttempted);
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    // (3) Debit. Single ledger row covers amount + reserve; the
+    //     unused-reserve refund (if any) goes in `settle_external_pay`.
+    sqlx::query(
+        "INSERT INTO ledger (user_id, kind, amount_msat, ref_hash, description, created_at) \
+         VALUES (?, 'payment_sent', ?, ?, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(-total)
+    .bind(payment_hash)
+    .bind(memo)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(ReserveResult::Reserved)
+}
+
+/// Finalize a successful external payment. Called from the
+/// `/payinvoice` handler when CLN's `pay` returns Ok, AND from the
+/// reconciler when it finds a previously-pending payment that has
+/// since become `complete` in `listpays`.
+///
+/// Effects (atomic):
+///   - payments row → `external_settled`, with preimage + actual fee.
+///   - If `fee_reserve_msat > actual_fee_msat`, credit the difference
+///     back to the user (`payment_fee_refund`).
+///
+/// Idempotency: the UPDATE is gated on `status = 'external_pending'`,
+/// so a second call simply UPDATES zero rows. We then return an
+/// error so the caller can log "already finalized" if needed. (The
+/// reconciler treats this as a no-op.)
+pub async fn settle_external_pay(
+    pool: &Pool,
+    user_id: i64,
+    payment_hash: &str,
+    preimage: &str,
+    actual_fee_msat: i64,
+    fee_reserve_msat: i64,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let now = unix_now();
+
+    let updated = sqlx::query(
+        "UPDATE payments \
+         SET status = 'external_settled', preimage = ?, fee_msat = ?, settled_at = ? \
+         WHERE payment_hash = ? AND user_id = ? AND status = 'external_pending'",
+    )
+    .bind(preimage)
+    .bind(actual_fee_msat)
+    .bind(now)
+    .bind(payment_hash)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    if updated == 0 {
+        tx.rollback().await?;
+        return Err(anyhow::anyhow!(
+            "settle_external_pay: no pending row for user {} hash {}",
+            user_id,
+            payment_hash
+        ));
+    }
+
+    // Refund unused fee reserve. Negative `unused` (over-spend) would
+    // be a bug — `pay` should refuse routes whose fee exceeds the
+    // request, and our reserve is a buffer above expected fees — so
+    // we treat that as an exception worth logging at the call site.
+    let unused = fee_reserve_msat - actual_fee_msat;
+    if unused > 0 {
+        sqlx::query(
+            "INSERT INTO ledger (user_id, kind, amount_msat, ref_hash, description, created_at) \
+             VALUES (?, 'payment_fee_refund', ?, ?, 'unused fee reserve refund', ?)",
+        )
+        .bind(user_id)
+        .bind(unused)
+        .bind(payment_hash)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Finalize a terminally-failed external payment.
+///
+/// Effects (atomic):
+///   - payments row → `external_failed`.
+///   - Compensating credit for the FULL reserved amount (amount + fee
+///     reserve) — the user is made whole.
+pub async fn fail_external_pay(
+    pool: &Pool,
+    user_id: i64,
+    payment_hash: &str,
+    amount_msat: i64,
+    fee_reserve_msat: i64,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let now = unix_now();
+    let total = amount_msat + fee_reserve_msat;
+
+    let updated = sqlx::query(
+        "UPDATE payments \
+         SET status = 'external_failed', settled_at = ? \
+         WHERE payment_hash = ? AND user_id = ? AND status = 'external_pending'",
+    )
+    .bind(now)
+    .bind(payment_hash)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    if updated == 0 {
+        tx.rollback().await?;
+        return Err(anyhow::anyhow!(
+            "fail_external_pay: no pending row for user {} hash {}",
+            user_id,
+            payment_hash
+        ));
+    }
+
+    sqlx::query(
+        "INSERT INTO ledger (user_id, kind, amount_msat, ref_hash, description, created_at) \
+         VALUES (?, 'payment_refund', ?, ?, 'refund: external pay terminal failure', ?)",
+    )
+    .bind(user_id)
+    .bind(total)
+    .bind(payment_hash)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Snapshot of a pending external payment used by the reconciler.
+///
+/// `#[allow(dead_code)]` on `created_at` because it's selected for
+/// future diagnostics (age-of-pending logging) but isn't currently
+/// read by the reconciler.
+pub struct PendingPayment {
+    pub user_id: i64,
+    pub payment_hash: String,
+    pub amount_msat: i64,
+    /// The reserved fee buffer (stored in `payments.fee_msat` until
+    /// settle replaces it with the actual fee).
+    pub fee_reserve_msat: i64,
+    #[allow(dead_code)]
+    pub created_at: i64,
+}
+
+/// All payments still in `external_pending`. The reconciler enumerates
+/// these and asks CLN's `listpays` what really happened to each.
+pub async fn list_pending_external(pool: &Pool) -> Result<Vec<PendingPayment>> {
+    let rows: Vec<(i64, String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT user_id, payment_hash, amount_msat, fee_msat, created_at \
+         FROM payments WHERE status = 'external_pending'",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(user_id, payment_hash, amount_msat, fee_reserve_msat, created_at)| PendingPayment {
+                user_id,
+                payment_hash,
+                amount_msat,
+                fee_reserve_msat,
+                created_at,
+            },
+        )
+        .collect())
+}
+
+// =====================================================================
 // Atomic credit-on-deposit (slice 5e)
 // =====================================================================
 

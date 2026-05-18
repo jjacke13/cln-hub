@@ -137,6 +137,183 @@ pub async fn deposit_watcher(state: Arc<AppState>) {
     }
 }
 
+// =====================================================================
+// External payment reconciler (slice 5b)
+// =====================================================================
+
+/// Every `RECONCILE_INTERVAL`, look at every `external_pending`
+/// payment, ask CLN's `listpays` what really happened, and finalize
+/// the row accordingly. Runs once at startup before the periodic
+/// loop kicks in, so crash-mid-pay state from a previous run is
+/// resolved before new requests can be served.
+///
+/// Why this exists:
+///
+///   The /payinvoice handler does {reserve → CLN pay → settle/fail}
+///   synchronously. If we crash between `pay` returning and the
+///   settle/fail transaction, the row is stuck in `external_pending`
+///   and the user's balance is locked. The reconciler unsticks them.
+///
+///   It also handles the CLN error codes we treat as "in-flight"
+///   (200, 210, 211): the handler returns 402 to the client, but the
+///   actual HTLCs may still resolve in the background. The reconciler
+///   picks those up.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+
+pub async fn payment_reconciler(state: Arc<AppState>) {
+    // Startup pass first — we may have pending rows from a crashed
+    // previous run.
+    log::info!("payment reconciler: initial startup sweep");
+    if let Err(e) = reconcile_once(&state).await {
+        log::warn!("payment reconciler startup sweep failed: {:#}", e);
+    }
+
+    log::info!(
+        "payment reconciler: periodic sweep every {}s",
+        RECONCILE_INTERVAL.as_secs()
+    );
+
+    loop {
+        tokio::time::sleep(RECONCILE_INTERVAL).await;
+        if let Err(e) = reconcile_once(&state).await {
+            log::warn!("payment reconciler sweep failed: {:#}", e);
+        }
+    }
+}
+
+/// One reconciliation pass. For each pending payment row, query CLN
+/// for its true state and finalize.
+async fn reconcile_once(state: &AppState) -> Result<()> {
+    let pending = db::list_pending_external(&state.db).await?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    log::debug!("payment reconciler: {} pending payment(s)", pending.len());
+
+    for p in pending {
+        if let Err(e) = reconcile_one(state, &p).await {
+            // Don't propagate — one bad row shouldn't stop the sweep.
+            log::warn!(
+                "reconcile failed for user={} hash={}: {:#}",
+                p.user_id,
+                p.payment_hash,
+                e
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Ask CLN about a single payment hash. CLN's `listpays` returns one
+/// or more attempt records under `.pays`; we look at the most recent
+/// one and act on its `status`.
+async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
+    let resp = cln::call(
+        &state.rpc_path,
+        "listpays",
+        json!({"payment_hash": p.payment_hash}),
+    )
+    .await?;
+
+    let pays = resp
+        .get("pays")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // No record on CLN's side. Could mean: we crashed BEFORE `pay`
+    // got far enough to register an attempt. In that case the user's
+    // funds are still notionally "in flight" with nothing real
+    // happening. Refund to be safe.
+    if pays.is_empty() {
+        log::warn!(
+            "reconcile: hash={} not known to listpays; refunding (assumed never sent)",
+            p.payment_hash
+        );
+        db::fail_external_pay(
+            &state.db,
+            p.user_id,
+            &p.payment_hash,
+            p.amount_msat,
+            p.fee_reserve_msat,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Take the LAST attempt (most recent). CLN appends; oldest first.
+    let last = pays.last().unwrap();
+    let status = last
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    match status {
+        "complete" => {
+            let preimage = last["preimage"].as_str().unwrap_or("").to_string();
+            let sent_msat = cln::parse_msat(&last["amount_sent_msat"])
+                .map(|n| n as i64)
+                .unwrap_or(p.amount_msat);
+            let actual_fee_msat = (sent_msat - p.amount_msat).max(0);
+
+            db::settle_external_pay(
+                &state.db,
+                p.user_id,
+                &p.payment_hash,
+                &preimage,
+                actual_fee_msat,
+                p.fee_reserve_msat,
+            )
+            .await?;
+
+            log::info!(
+                "reconcile: settled hash={} user={} amount={}msat fee={}msat",
+                p.payment_hash,
+                p.user_id,
+                p.amount_msat,
+                actual_fee_msat
+            );
+        }
+        "failed" => {
+            db::fail_external_pay(
+                &state.db,
+                p.user_id,
+                &p.payment_hash,
+                p.amount_msat,
+                p.fee_reserve_msat,
+            )
+            .await?;
+            log::info!(
+                "reconcile: failed hash={} user={} — refunded",
+                p.payment_hash,
+                p.user_id
+            );
+        }
+        "pending" => {
+            // Still in flight. Next sweep.
+            log::debug!(
+                "reconcile: hash={} user={} still pending on CLN",
+                p.payment_hash,
+                p.user_id
+            );
+        }
+        other => {
+            log::warn!(
+                "reconcile: hash={} unexpected status '{}', leaving pending",
+                p.payment_hash,
+                other
+            );
+        }
+    }
+
+    Ok(())
+}
+
+// =====================================================================
+// Deposit watcher helpers
+// =====================================================================
+
 /// One pass of the watcher: enumerate outputs, credit any we haven't
 /// seen yet. Errors are propagated to `deposit_watcher`'s loop, which
 /// logs them and keeps going.

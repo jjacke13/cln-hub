@@ -179,6 +179,16 @@ async fn main() -> Result<()> {
     let watcher_state = Arc::clone(&state);
     tokio::spawn(plugin::deposit_watcher(watcher_state));
 
+    // ---- External-payment reconciler ----
+    //
+    // Resolves any `external_pending` payments — either from a crash
+    // during the synchronous /payinvoice flow, or from CLN responses
+    // that came back with an "in-flight" error code (200/210/211).
+    // The reconciler does one synchronous startup pass + a 60s
+    // periodic loop. See `plugin::payment_reconciler` for details.
+    let reconciler_state = Arc::clone(&state);
+    tokio::spawn(plugin::payment_reconciler(reconciler_state));
+
     // ---- Phase 2: start (commit the state, begin event loop) ----
     //
     // After this, lightningd considers us "running" and can deliver

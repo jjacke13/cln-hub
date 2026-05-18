@@ -119,12 +119,14 @@ pub(super) async fn payinvoice(
                 amount_msat,
                 payment_hash,
             );
+            // Internal payment — no real preimage from the network.
             Ok(Json(payment_response(
                 &destination,
                 &payment_hash,
                 amount_msat,
                 0,
                 &memo,
+                None,
             )))
         }
 
@@ -141,10 +143,197 @@ pub(super) async fn payinvoice(
         )),
 
         NotOurInvoice => {
-            // Slice 5b will wire the CLN `pay` call here.
+            // Slice 5b: external Lightning payment via CLN `pay`.
+            external_pay(
+                &state,
+                auth.user_id,
+                &payment_hash,
+                &req.invoice,
+                &memo,
+                &destination,
+                amount_msat,
+            )
+            .await
+        }
+    }
+}
+
+// =====================================================================
+// External pay (slice 5b)
+// =====================================================================
+
+/// Fee buffer above the requested amount. The handler reserves this
+/// up-front; whatever CLN actually pays in fees gets locked in on
+/// settle, and the difference is refunded to the user.
+///
+/// Heuristic: max(1% of amount, 5 sat). Tuned to comfortably cover
+/// CLN's default `maxfeepercent=0.5` + `exemptfee=5000msat` routing
+/// budget. Bigger buffers mean fewer rejections; smaller buffers mean
+/// less locked balance during in-flight pays.
+fn compute_fee_reserve_msat(amount_msat: i64) -> i64 {
+    std::cmp::max(amount_msat / 100, 5_000)
+}
+
+/// CLN `pay` RPC error codes we treat as IN-FLIGHT rather than terminal.
+/// HTLCs may still be live, so we MUST NOT refund — the reconciler
+/// will resolve the real state via `listpays`.
+///
+///   200 PAY_IN_PROGRESS         — a previous `pay` for this hash is still active
+///   210 PAY_STOPPED_RETRYING    — retry_for window expired mid-attempt
+///   211 PAY_STATUS_UNEXPECTED   — CLN can't determine state
+fn is_in_flight_error(code: i64) -> bool {
+    matches!(code, 200 | 210 | 211)
+}
+
+async fn external_pay(
+    state: &Arc<AppState>,
+    user_id: i64,
+    payment_hash: &str,
+    bolt11: &str,
+    memo: &str,
+    destination: &str,
+    amount_msat: i64,
+) -> Result<Json<Value>, AppError> {
+    let fee_reserve_msat = compute_fee_reserve_msat(amount_msat);
+
+    // ---- 1. Reserve (atomic: balance check + pending row + ledger debit). ----
+    use db::ReserveResult::*;
+    match db::reserve_external_pay(
+        &state.db,
+        user_id,
+        payment_hash,
+        bolt11,
+        memo,
+        amount_msat,
+        fee_reserve_msat,
+    )
+    .await?
+    {
+        Reserved => {}
+        InsufficientBalance {
+            balance_msat,
+            required_msat,
+        } => {
+            return Err(AppError::payment(
+                5,
+                format!(
+                    "not enough balance: have {} msat, need {} msat (incl. fee reserve)",
+                    balance_msat, required_msat
+                ),
+            ))
+        }
+        AlreadyAttempted => {
+            return Err(AppError::payment(
+                7,
+                "a payment to this invoice is already in progress or completed",
+            ))
+        }
+    }
+
+    // ---- 2. Call CLN `pay`. ----
+    //
+    // Blocks (possibly tens of seconds) while CLN tries routes.
+    // Default retry_for is 60s; we leave it at the default so any
+    // error returned is terminal (or one of the in-flight codes we
+    // explicitly recognise).
+    let pay_result = cln::call_strict(
+        &state.rpc_path,
+        "pay",
+        json!({
+            "bolt11": bolt11,
+        }),
+    )
+    .await;
+
+    // ---- 3. Resolve (atomic settle or fail+refund). ----
+    match pay_result {
+        Ok(resp) => {
+            // CLN pay returned terminal-success: a complete payment
+            // with preimage.
+            let preimage = resp["payment_preimage"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let sent_msat = cln::parse_msat(&resp["amount_sent_msat"])
+                .map(|n| n as i64)
+                .unwrap_or(amount_msat);
+            let actual_fee_msat = (sent_msat - amount_msat).max(0);
+
+            db::settle_external_pay(
+                &state.db,
+                user_id,
+                payment_hash,
+                &preimage,
+                actual_fee_msat,
+                fee_reserve_msat,
+            )
+            .await?;
+
+            log::info!(
+                "external pay settled: user={} hash={} amount={}msat fee={}msat",
+                user_id,
+                payment_hash,
+                amount_msat,
+                actual_fee_msat
+            );
+
+            Ok(Json(payment_response(
+                destination,
+                payment_hash,
+                amount_msat,
+                actual_fee_msat,
+                memo,
+                Some(&preimage),
+            )))
+        }
+
+        Err(cln::CallErr::Rpc { code, message, .. }) if is_in_flight_error(code) => {
+            // HTLCs may still be live. Leave the row `external_pending`
+            // and rely on the reconciler to settle / fail later.
+            log::warn!(
+                "external pay in flight (code {}): user={} hash={} — leaving pending, reconciler will resolve",
+                code, user_id, payment_hash
+            );
             Err(AppError::payment(
                 6,
-                "external payments are not yet wired (slice 5b — needs channels)",
+                format!(
+                    "payment in progress (CLN code {}: {}); check /gettxs shortly",
+                    code, message
+                ),
+            ))
+        }
+
+        Err(cln::CallErr::Rpc { code, message, .. }) => {
+            // Terminal failure. Refund the user.
+            log::warn!(
+                "external pay failed (code {}): user={} hash={} — refunding",
+                code, user_id, payment_hash
+            );
+            db::fail_external_pay(
+                &state.db,
+                user_id,
+                payment_hash,
+                amount_msat,
+                fee_reserve_msat,
+            )
+            .await?;
+            Err(AppError::payment(
+                6,
+                format!("payment failed (CLN code {}: {})", code, message),
+            ))
+        }
+
+        Err(cln::CallErr::Transport(e)) => {
+            // Couldn't talk to lightningd or the response was
+            // unparseable. We don't know the payment's real state, so
+            // leave it pending. The reconciler retries.
+            log::error!(
+                "external pay transport error: user={} hash={}: {:#} — leaving pending",
+                user_id, payment_hash, e
+            );
+            Err(AppError::payment(
+                6,
+                "transport error talking to lightningd; check /gettxs shortly",
             ))
         }
     }
@@ -152,22 +341,28 @@ pub(super) async fn payinvoice(
 
 /// Build the LndHub-shaped /payinvoice success response.
 ///
-/// Internal payments have no real Lightning preimage — the CLN
-/// invoice on this node is never actually settled by the network.
-/// We return all-zero hex as a clearly-placeholder preimage; clients
-/// that don't verify sha256(preimage)==payment_hash treat it as
-/// success, and clients that do can be told to skip the check for
-/// internal payments.
+/// For internal payments there's no real Lightning preimage (the CLN
+/// invoice on this node is never actually settled by the network);
+/// we pass `None` and the response uses all-zero hex as a clearly-
+/// placeholder value. For external payments we pass `Some(<hex>)`
+/// from CLN's `pay` response.
 fn payment_response(
     destination: &str,
     payment_hash: &str,
     amount_msat: i64,
     fee_msat: i64,
     memo: &str,
+    preimage: Option<&str>,
 ) -> Value {
+    // `unwrap_or_else` so the 64-zero string is only allocated when
+    // we actually need it (the closure runs lazily).
+    let preimage_str = preimage
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "0".repeat(64));
+
     json!({
         "payment_error": "",
-        "payment_preimage": "0".repeat(64),  // 32 zero bytes hex-encoded
+        "payment_preimage": preimage_str,
         "payment_route": {
             "total_amt": amount_msat / 1000,
             "total_fees": fee_msat / 1000,
