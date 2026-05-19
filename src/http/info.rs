@@ -1,8 +1,13 @@
 // src/http/info.rs
 //
 // Read-only / informational endpoints:
-//   - /decodeinvoice          — passthrough to CLN's `decode`
-//   - /checkpayment/:hash     — has the local invoice settled yet?
+//   - /decodeinvoice          — passthrough to CLN's `decode` (public,
+//                               body-size + length capped)
+//   - /checkpayment/:hash     — has the calling user's invoice with
+//                               this hash settled yet? (authenticated,
+//                               owner-scoped — see handler doc for
+//                               why; ex-LndHub it was a public probe
+//                               oracle)
 
 use std::sync::Arc;
 

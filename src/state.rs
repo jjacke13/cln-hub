@@ -21,10 +21,14 @@ pub struct AppState {
 
     /// Minimum on-chain confirmations before the deposit watcher
     /// credits a UTXO to the owning user's ledger. Configured via
-    /// the `cln-hub-min-deposit-confs` plugin option (default 2).
+    /// the `cln-hub-min-deposit-confs` plugin option (default 6 —
+    /// the industry-custody norm for mainnet).
     ///
-    /// Setting this to 1 mirrors CLN's own "confirmed" semantics
-    /// (fast UX, exposed to single-block reorgs). Setting it to
-    /// 3+ matches typical LndHub-fork policy.
+    /// Lower values trade UX latency for reorg exposure: 1 mirrors
+    /// CLN's own "confirmed" semantics but credits before a single
+    /// block can be re-orged out; 2–3 sit near typical LndHub-fork
+    /// policy. Anything below 3 emits a startup WARN. Regtest /
+    /// experiment networks routinely use 1–2 — fine, no real funds
+    /// at risk.
     pub min_deposit_confs: i64,
 }

@@ -6,10 +6,12 @@
 //   - `AuthUser`        — the "must be signed in" extractor
 //
 // The handlers themselves live in topical submodules:
-//   - info     : /getinfo, /decodeinvoice, /checkpayment
+//   - info     : /getinfo, /decodeinvoice, /checkpayment (authenticated,
+//                owner-scoped)
 //   - auth     : /create, /auth
 //   - invoice  : /addinvoice, /getuserinvoices
-//   - payment  : /payinvoice, /getbalance, /gettxs
+//   - payment  : /payinvoice, /getbalance, /balance, /gettxs,
+//                /getpending, /getbtc
 //
 // Splitting up vs leaving as one file: each submodule stays under
 // ~150 lines, the router gives a one-glance view of the whole API

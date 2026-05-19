@@ -1,10 +1,14 @@
 // src/http/payment.rs
 //
 // Payment-related authenticated endpoints:
-//   - POST /payinvoice   — pay a BOLT11 (internal short-circuit only
-//                          for now; external CLN `pay` is slice 5b)
+//   - POST /payinvoice   — pay a BOLT11. Internal short-circuit for
+//                          intra-hub destinations; external goes
+//                          through CLN `pay` with reserve/refund.
 //   - GET  /getbalance   — current balance, LndHub shape
-//   - GET  /gettxs       — outbound payment history, LndHub shape
+//   - GET  /gettxs       — outbound payment history + on-chain credits
+//   - GET  /getpending   — pending on-chain deposits (always `[]`,
+//                          deposits credit only after confirmation)
+//   - GET  /getbtc       — per-user persistent on-chain deposit address
 
 use std::sync::Arc;
 
