@@ -56,3 +56,27 @@ jobs:
 
       - name: cargo test
         run: cargo test --verbose
+
+      # Vulnerability scan against the RustSec advisory database.
+      # Runs after build/clippy/test so a transient cargo-audit
+      # outage doesn't mask the more important checks.
+      #
+      # Why the single ignore: RUSTSEC-2023-0071 flags a timing-oracle
+      # in `rsa` 0.9.10. The crate enters our dep-graph via
+      # `sqlx-mysql`, which we DO NOT compile — sqlx is locked to
+      # features = ["sqlite", "runtime-tokio"]. Verified unreachable:
+      # `nm target/debug/cln-hub | grep rsa::` and
+      # `ls target/debug/deps/ | grep -E '^(rsa|sqlx_mysql)-'` both
+      # come back empty. No fixed upgrade is available upstream;
+      # revisit when sqlx 0.9 lands or the macros crate is decoupled
+      # from the per-backend deps.
+      #
+      # `--deny warnings` promotes informational notices (yanked
+      # crates, unmaintained) to CI-fail so they don't silently
+      # accumulate.
+      - name: cargo audit (vuln scan)
+        run: |
+          if ! command -v cargo-audit >/dev/null; then
+            cargo install --locked cargo-audit
+          fi
+          cargo audit --deny warnings --ignore RUSTSEC-2023-0071

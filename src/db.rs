@@ -107,11 +107,43 @@ pub mod users {
     use super::{anyhow, unix_now, Pool, Result};
 
     use argon2::password_hash::{rand_core::OsRng, SaltString};
-    use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+    use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
+
+    /// Argon2id parameters used for password hashing.
+    ///
+    /// `Argon2::default()` in the `argon2` 0.5.x crate produces
+    /// (m=19 MiB, t=2, p=1) — already an OWASP-2023-recommended
+    /// preset. We pin the stronger alternative (m=46 MiB, t=1, p=1):
+    /// one pass over a larger memory region. Wall-clock cost is
+    /// similar to the default but the brute-force memory budget for
+    /// an attacker is ~2.4x larger.
+    ///
+    /// Existing password hashes from earlier defaults keep validating
+    /// because each PHC-encoded hash string carries its own params
+    /// and `PasswordHash::new` reads them back at verify time.
+    /// Re-hashing on next login is a future option; not done today.
+    ///
+    /// 46 MiB per concurrent /create or /auth call. /create is
+    /// rate-limited to 5/min/IP and /auth to 30/min/IP, so peak
+    /// memory pressure is bounded for any one client.
+    const ARGON2_M_COST_KIB: u32 = 46 * 1024;
+    const ARGON2_T_COST: u32 = 1;
+    const ARGON2_P_COST: u32 = 1;
+
+    /// Build the Argon2 hasher with the pinned params. Centralised so
+    /// the create + verify paths can't drift apart.
+    fn argon2() -> Argon2<'static> {
+        // `Params::new` validates ranges; with the constants above
+        // (well inside argon2's allowed bounds) it cannot fail. We
+        // still `expect` rather than `unwrap` to give a clear panic
+        // message if someone bumps the constants out of range later.
+        let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
+            .expect("argon2 params out of range");
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+    }
 
     /// Insert a new user. The plaintext password is hashed with
-    /// argon2id (default params, ~64 MiB memory, 3 rounds, 4 lanes —
-    /// the OWASP recommendation as of 2024).
+    /// argon2id (see ARGON2_* constants above).
     ///
     /// Returns the new user's id (SQLite rowid).
     pub async fn create(pool: &Pool, login: &str, password: &str) -> Result<i64> {
@@ -158,7 +190,10 @@ pub mod users {
         let parsed = PasswordHash::new(&hash)
             .map_err(|e| anyhow!("password hash parse failure: {}", e))?;
 
-        if Argon2::default()
+        // `verify_password` re-derives the hasher from the PHC string,
+        // so old hashes created with previous params still verify
+        // correctly even after we bump `argon2()`'s constants.
+        if argon2()
             .verify_password(password.as_bytes(), &parsed)
             .is_ok()
         {
@@ -170,13 +205,57 @@ pub mod users {
 
     fn hash_password(password: &str) -> Result<String> {
         let salt = SaltString::generate(&mut OsRng);
-        let hash = Argon2::default()
+        let hash = argon2()
             .hash_password(password.as_bytes(), &salt)
             // `password_hash::Error` doesn't impl `std::error::Error`
             // (yet), so anyhow can't auto-convert it; we map manually.
             .map_err(|e| anyhow!("argon2 hashing failure: {}", e))?
             .to_string();
         Ok(hash)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Confirms the constants we ship match the doc-comment:
+        /// (m=46 MiB, t=1, p=1) — argon2id, version 0x13.
+        ///
+        /// This test is a tripwire: if anyone bumps the constants
+        /// without updating the comment + this assert, the build
+        /// goes red instead of silently drifting.
+        #[test]
+        fn argon2_params_are_owasp_compliant() {
+            assert_eq!(ARGON2_M_COST_KIB, 46 * 1024);
+            assert_eq!(ARGON2_T_COST, 1);
+            assert_eq!(ARGON2_P_COST, 1);
+
+            let a = argon2();
+            assert_eq!(a.params().m_cost(), 46 * 1024);
+            assert_eq!(a.params().t_cost(), 1);
+            assert_eq!(a.params().p_cost(), 1);
+        }
+
+        /// Old hashes (produced with argon2 0.5.x defaults of m=19 MiB
+        /// t=2 p=1) still verify under the new hasher, because PHC
+        /// strings carry their own params. Without this property,
+        /// bumping the constants would lock out every pre-bump user.
+        #[test]
+        fn old_default_param_hash_still_verifies() {
+            // Hash produced by `Argon2::default().hash_password(...)`
+            // in argon2 0.5.x against password "s3cret". Captured
+            // verbatim — the PHC string encodes m=19456, t=2, p=1.
+            let phc = "$argon2id$v=19$m=19456,t=2,p=1$0ZiZsGrsNc6XnFyEv8aPEQ$aVKb2RkFjQEW7lIkWR6DBiA2X1pk3owcUhiMz/4GRcY";
+            let parsed = PasswordHash::new(phc).expect("parse old PHC");
+            assert!(argon2()
+                .verify_password(b"s3cret", &parsed)
+                .is_ok(),
+                "old hashes must keep verifying after param bump");
+            assert!(argon2()
+                .verify_password(b"WRONG", &parsed)
+                .is_err(),
+                "wrong password against old hash must still fail");
+        }
     }
 }
 
