@@ -1,8 +1,8 @@
 # cln-hub
 
-> **DO NOT USE WITH REAL FUNDS YET**
+> **HAS BEEN TESTED ON MAINNET USING ZEUS MOBILE WALLET**
 >
-> **THIS IS A WORK IN PROGRESS**
+> **USE WITH CAUTION IN MAINNET AND DON'T EXPOSE IT PUBLICLY WITHOUT ANY HTTPS REVERSE PROXY**
 
 cln-hub is a [Core Lightning](https://github.com/ElementsProject/lightning) plugin that turns your CLN node into a multi-tenant custodial Lightning service.
 
