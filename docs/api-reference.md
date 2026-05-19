@@ -142,7 +142,24 @@ Issue a BOLT11 invoice owned by the calling user. When this invoice is paid (by 
 
 List the calling user's invoices, newest first.
 
-**Response 200:** an array of invoice objects. Each one carries the BOLT11, the amount, the memo, the creation timestamp, and a `settled_at` field that becomes non-null once the invoice is paid.
+**Response 200:** an array of invoice objects. Each object has the shape:
+
+```json
+{
+  "r_hash":           "1463978eaad6d761…",
+  "payment_request":  "lnbc70u1p4qkh88sp52y…",
+  "ispaid":           false,
+  "type":             "user_invoice",
+  "amt":              7000,
+  "amt_msat":         7000000,
+  "settled_amt_msat": null,
+  "expire_time":      3600,
+  "timestamp":        1747688400,
+  "description":      "coffee"
+}
+```
+
+`ispaid` flips to `true` once the invoice settles. `settled_amt_msat` is `null` until then; afterwards it holds the actual paid amount in millisatoshis. `expire_time` is the remaining validity window in seconds at issue time (CLN-supplied `expires_at` minus our creation timestamp). `timestamp` is unix epoch seconds.
 
 ### `POST /payinvoice`
 
@@ -215,12 +232,50 @@ Return the calling user's current balance.
 
 ### `GET /gettxs`
 
-List the calling user's outbound transaction history, newest first. Entries come in two shapes:
+List the calling user's outbound Lightning payments and confirmed on-chain deposits, newest first. The response is a single array; entries are discriminated by their `type` field.
 
-- `type: "paid_invoice"` — completed outbound Lightning payments.
-- `type: "bitcoind_tx"` — confirmed on-chain deposits, in LndHub's canonical shape (`amount` as a BTC-denominated float, `category: "receive"`).
+**`type: "paid_invoice"`** — a completed outbound Lightning payment:
 
-Only completed payments appear here. Failed and in-flight Lightning payments are not exposed via `/gettxs`.
+```json
+{
+  "type":             "paid_invoice",
+  "value":            4000,
+  "value_msat":       4000000,
+  "fee":              0,
+  "fee_msat":         0,
+  "memo":             "coffee",
+  "payment_hash":     "2f4f11f4a959a82bfbc15d4c1dff6…",
+  "payment_preimage": "54dac17feb9bf90d9432d533d616…",
+  "payment_request":  "lnbcrt40u1p4qkhngsp5wakatef…",
+  "status":           "external_settled",
+  "timestamp":        1779129960,
+  "settled_at":       1779129960
+}
+```
+
+`status` is either `internal` (hub-to-hub short-circuit, no Lightning HTLC) or `external_settled` (paid over Lightning). Internal payments report `payment_preimage` as 64 zeros — no real preimage exists when the payment never touches the network.
+
+**`type: "bitcoind_tx"`** — a confirmed on-chain deposit to the caller's `/getbtc` address, in LndHub's canonical shape:
+
+```json
+{
+  "type":         "bitcoind_tx",
+  "amount":       0.0007,
+  "amount_msat":  70000000,
+  "category":     "receive",
+  "confirmations": null,
+  "address":      "bc1q2qln3x922t0ejanj3xny8uu9ygg84ct9v3nafu",
+  "txid":         "13c134bb2fcbfd81f269fc45005a3223cd59ca4baf0ad98c137987bf41a902bc",
+  "vout":         0,
+  "blockheight":  112,
+  "time":         1779127146,
+  "timestamp":    1779127146
+}
+```
+
+`amount` is a BTC-denominated float (LndHub canon); `amount_msat` is the same value in millisatoshis. `confirmations` is always `null` (we don't recompute live depth; the credit only lands after the configured `cln-hub-min-deposit-confs` threshold has been crossed).
+
+Only **completed** payments appear here. Failed and in-flight Lightning payments are not exposed via `/gettxs`.
 
 ### `GET /getpending`
 
