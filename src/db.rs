@@ -563,10 +563,29 @@ pub mod payments {
     const SELECT_COLS: &str = "id, payment_hash, user_id, bolt11, amount_msat, fee_msat, \
                                preimage, status, memo, created_at, settled_at";
 
-    /// List a user's outbound payments, newest first.
+    /// List a user's **settled** outbound payments, newest first.
+    ///
+    /// === Why the status filter ===
+    ///
+    /// LndHub's `/gettxs` historically returns only completed
+    /// payments. Returning `external_failed` or `external_pending`
+    /// rows here causes wallet clients (Zeus in particular) to render
+    /// the entries as if they were successful payments — the per-row
+    /// `status` field exists in our response but Zeus's parser
+    /// treats every `paid_invoice` entry as paid. The user-visible
+    /// effect is a phantom outgoing payment in the history with a
+    /// balance that doesn't match.
+    ///
+    /// Filtering at the database layer keeps the wire payload
+    /// truthful to the LndHub contract. Failed and pending payments
+    /// are still in the `payments` table for the reconciler, audit
+    /// queries, and any future operator dashboard — they just don't
+    /// leak into the client-facing transactions feed.
     pub async fn list_for_user(pool: &Pool, user_id: i64) -> Result<Vec<Row>> {
         let q = format!(
-            "SELECT {SELECT_COLS} FROM payments WHERE user_id = ? ORDER BY created_at DESC"
+            "SELECT {SELECT_COLS} FROM payments \
+             WHERE user_id = ? AND status IN ('internal', 'external_settled') \
+             ORDER BY created_at DESC"
         );
         let rows: Vec<RowTuple> = sqlx::query_as(&q).bind(user_id).fetch_all(pool).await?;
         Ok(rows.into_iter().map(from_tuple).collect())
@@ -1810,6 +1829,69 @@ mod tests {
         let bob = make_user(&pool, "bob").await;
         let bob_rows = onchain_credits::list_for_user(&pool, bob).await.unwrap();
         assert!(bob_rows.is_empty());
+    }
+
+    // ---------- payments::list_for_user (status filter) ----------
+
+    #[tokio::test]
+    async fn payments_list_for_user_excludes_failed_and_pending() {
+        // Regression test: Zeus rendered failed payments as if they
+        // had succeeded because /gettxs returned every payments row
+        // regardless of status. `list_for_user` now filters to
+        // `internal` + `external_settled` so client wallets only see
+        // genuinely completed payments.
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        seed_balance(&pool, alice, 1_000_000).await;
+
+        // Settled external — should appear.
+        reserve_external_pay(&pool, alice, "ok_hash", "lnbc-ok", "memo", 10_000, 1_000)
+            .await
+            .unwrap();
+        settle_external_pay(&pool, alice, "ok_hash", "00000000000000000000000000000000000000000000000000000000aaaaaaaa", 500, 1_000)
+            .await
+            .unwrap();
+
+        // Failed external — should NOT appear.
+        reserve_external_pay(&pool, alice, "fail_hash", "lnbc-fail", "memo", 20_000, 2_000)
+            .await
+            .unwrap();
+        fail_external_pay(&pool, alice, "fail_hash", 20_000, 2_000)
+            .await
+            .unwrap();
+
+        // Pending external — should NOT appear.
+        reserve_external_pay(&pool, alice, "pending_hash", "lnbc-pending", "memo", 30_000, 3_000)
+            .await
+            .unwrap();
+
+        // Internal — should appear. Use try_settle_internal to set up
+        // a hub-to-hub completed payment.
+        let bob = make_user(&pool, "bob").await;
+        make_invoice(&pool, bob, "inv_internal", 5_000).await;
+        try_settle_internal(&pool, alice, "inv_internal", "lnbc-internal", 5_000, "memo")
+            .await
+            .unwrap();
+
+        let rows = payments::list_for_user(&pool, alice).await.unwrap();
+        let hashes: Vec<&str> = rows.iter().map(|r| r.payment_hash.as_str()).collect();
+        assert!(
+            hashes.contains(&"ok_hash"),
+            "settled external payment must appear"
+        );
+        assert!(
+            hashes.contains(&"inv_internal"),
+            "settled internal payment must appear"
+        );
+        assert!(
+            !hashes.contains(&"fail_hash"),
+            "failed payments must NOT leak into client tx history"
+        );
+        assert!(
+            !hashes.contains(&"pending_hash"),
+            "pending payments must NOT leak into client tx history"
+        );
+        assert_eq!(rows.len(), 2);
     }
 
     // ---------- credit_onchain ----------
