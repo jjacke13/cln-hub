@@ -728,7 +728,7 @@ pub async fn balance_msat(pool: &Pool, user_id: i64) -> Result<i64> {
 pub enum ReserveResult {
     /// Reserved successfully. Caller MUST eventually finalize via
     /// `settle_external_pay` or `fail_external_pay`.
-    Reserved,
+    Reserved { payment_id: i64, cln_label: String },
     /// Balance check failed inside the reserve transaction.
     InsufficientBalance {
         balance_msat: i64,
@@ -817,8 +817,8 @@ pub async fn reserve_external_pay(
     .execute(&mut *tx)
     .await;
 
-    match insert {
-        Ok(_) => {}
+    let payment_id = match insert {
+        Ok(result) => result.last_insert_rowid(),
         // The partial UNIQUE index from migration 0003 / 0006 means
         // this row already exists in some state (pending or settled).
         // `dbe.is_unique_violation()` is sqlx's portable way to
@@ -828,7 +828,13 @@ pub async fn reserve_external_pay(
             return Ok(ReserveResult::AlreadyAttempted);
         }
         Err(e) => return Err(e.into()),
-    }
+    };
+    let cln_label = format!("cln-hub:payment:{payment_id}");
+    sqlx::query("UPDATE payments SET cln_label = ? WHERE id = ?")
+        .bind(&cln_label)
+        .bind(payment_id)
+        .execute(&mut *tx)
+        .await?;
 
     // (3) Debit. Single ledger row covers amount + reserve; the
     //     unused-reserve refund (if any) goes in `settle_external_pay`.
@@ -845,7 +851,10 @@ pub async fn reserve_external_pay(
     .await?;
 
     tx.commit().await?;
-    Ok(ReserveResult::Reserved)
+    Ok(ReserveResult::Reserved {
+        payment_id,
+        cln_label,
+    })
 }
 
 /// Finalize a successful external payment. Called from the
@@ -871,47 +880,28 @@ pub async fn reserve_external_pay(
 ///   - `Err(_)`    — database error.
 pub async fn settle_external_pay(
     pool: &Pool,
-    user_id: i64,
-    payment_hash: &str,
+    payment_id: i64,
     preimage: &str,
     actual_fee_msat: i64,
-    fee_reserve_msat: i64,
 ) -> Result<bool> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let row: Option<(i64, String, i64)> = sqlx::query_as(
+        "SELECT user_id, payment_hash, fee_msat FROM payments WHERE id = ? AND status = 'external_pending'",
+    ).bind(payment_id).fetch_optional(&mut *tx).await?;
+    let Some((user_id, payment_hash, fee_reserve_msat)) = row else {
+        tx.rollback().await?;
+        return Ok(false);
+    };
     anyhow::ensure!(
         actual_fee_msat >= 0 && actual_fee_msat <= fee_reserve_msat,
         "actual fee exceeds reserved fee"
     );
-    let mut tx = pool.begin().await?;
     let now = unix_now();
-
-    let updated = sqlx::query(
-        "UPDATE payments \
-         SET status = CASE WHEN EXISTS(SELECT 1 FROM invoices WHERE invoices.payment_hash = payments.payment_hash) \
-             THEN 'internal' ELSE 'external_settled' END, preimage = ?, fee_msat = ?, settled_at = ? \
-         WHERE payment_hash = ? AND user_id = ? AND status = 'external_pending'",
-    )
-    .bind(preimage)
-    .bind(actual_fee_msat)
-    .bind(now)
-    .bind(payment_hash)
-    .bind(user_id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-
-    if updated == 0 {
-        // Already finalized by a concurrent path (the
-        // /payinvoice in-band handler and the reconciler can race
-        // when CLN settles slowly). No error; caller picks up
-        // current row state if it needs to.
-        tx.rollback().await?;
-        return Ok(false);
-    }
-
-    // Refund unused fee reserve. Negative `unused` (over-spend) would
-    // be a bug — `pay` should refuse routes whose fee exceeds the
-    // request, and our reserve is a buffer above expected fees — so
-    // we treat that as an exception worth logging at the call site.
+    sqlx::query(
+        "UPDATE payments SET status = CASE WHEN EXISTS(SELECT 1 FROM invoices \
+         WHERE invoices.payment_hash = payments.payment_hash) THEN 'internal' ELSE 'external_settled' END, \
+         preimage = ?, fee_msat = ?, settled_at = ? WHERE id = ? AND status = 'external_pending'",
+    ).bind(preimage).bind(actual_fee_msat).bind(now).bind(payment_id).execute(&mut *tx).await?;
     let unused = fee_reserve_msat - actual_fee_msat;
     if unused > 0 {
         sqlx::query(
@@ -920,64 +910,39 @@ pub async fn settle_external_pay(
         )
         .bind(user_id)
         .bind(unused)
-        .bind(payment_hash)
+        .bind(&payment_hash)
         .bind(now)
         .execute(&mut *tx)
         .await?;
     }
-
     tx.commit().await?;
     Ok(true)
 }
 
-/// Finalize a terminally-failed external payment.
-///
-/// Effects (atomic, only when the row is still `external_pending`):
-///   - payments row → `external_failed`.
-///   - Compensating credit for the FULL reserved amount (amount + fee
-///     reserve) — the user is made whole.
-///
-/// Same idempotency contract as `settle_external_pay`: `Ok(false)`
-/// when another caller already finalized the row.
-pub async fn fail_external_pay(
-    pool: &Pool,
-    user_id: i64,
-    payment_hash: &str,
-    amount_msat: i64,
-    fee_reserve_msat: i64,
-) -> Result<bool> {
-    let total = crate::amount::reserve_total(amount_msat, fee_reserve_msat)?;
-    let mut tx = pool.begin().await?;
-    let now = unix_now();
-
-    let updated = sqlx::query(
-        "UPDATE payments \
-         SET status = 'external_failed', settled_at = ? \
-         WHERE payment_hash = ? AND user_id = ? AND status = 'external_pending'",
-    )
-    .bind(now)
-    .bind(payment_hash)
-    .bind(user_id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-
-    if updated == 0 {
+/// Refund only this attempt, using its own stored amounts and owner.
+pub async fn fail_external_pay(pool: &Pool, payment_id: i64) -> Result<bool> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let row: Option<(i64, String, i64, i64)> = sqlx::query_as(
+        "SELECT user_id, payment_hash, amount_msat, fee_msat FROM payments WHERE id = ? AND status = 'external_pending'",
+    ).bind(payment_id).fetch_optional(&mut *tx).await?;
+    let Some((user_id, payment_hash, amount_msat, fee_reserve_msat)) = row else {
         tx.rollback().await?;
         return Ok(false);
-    }
-
+    };
+    let total = crate::amount::reserve_total(amount_msat, fee_reserve_msat)?;
+    let now = unix_now();
+    sqlx::query("UPDATE payments SET status='external_failed', settled_at=? WHERE id=? AND status='external_pending'")
+        .bind(now).bind(payment_id).execute(&mut *tx).await?;
     sqlx::query(
         "INSERT INTO ledger (user_id, kind, amount_msat, ref_hash, description, created_at) \
          VALUES (?, 'payment_refund', ?, ?, 'refund: external pay terminal failure', ?)",
     )
     .bind(user_id)
     .bind(total)
-    .bind(payment_hash)
+    .bind(&payment_hash)
     .bind(now)
     .execute(&mut *tx)
     .await?;
-
     tx.commit().await?;
     Ok(true)
 }
@@ -988,53 +953,24 @@ pub async fn fail_external_pay(
 /// several consecutive empty sightings before assuming the payment
 /// truly never left the node and refunding the user.
 ///
-/// No-op if the row is no longer `external_pending` (a concurrent
-/// settle/fail already finalized it); the inner UPDATE matches zero
-/// rows and the subsequent SELECT just returns whatever count is on
-/// disk. The reconciler treats a no-op as "we lost the race, skip".
-pub async fn bump_empty_listpays_sweeps(
-    pool: &Pool,
-    user_id: i64,
-    payment_hash: &str,
-) -> Result<i64> {
-    sqlx::query(
-        "UPDATE payments \
-         SET empty_listpays_sweeps = empty_listpays_sweeps + 1 \
-         WHERE user_id = ? AND payment_hash = ? AND status = 'external_pending'",
-    )
-    .bind(user_id)
-    .bind(payment_hash)
-    .execute(pool)
-    .await?;
-
+/// Returns zero if this exact attempt is no longer pending.
+pub async fn bump_empty_listpays_sweeps(pool: &Pool, payment_id: i64) -> Result<i64> {
     let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT empty_listpays_sweeps FROM payments \
-         WHERE user_id = ? AND payment_hash = ?",
+        "UPDATE payments SET empty_listpays_sweeps = empty_listpays_sweeps + 1 \
+         WHERE id = ? AND status = 'external_pending' RETURNING empty_listpays_sweeps",
     )
-    .bind(user_id)
-    .bind(payment_hash)
+    .bind(payment_id)
     .fetch_optional(pool)
     .await?;
-
-    Ok(row.map(|(n,)| n).unwrap_or(0))
+    Ok(row.map(|(count,)| count).unwrap_or(0))
 }
 
-/// Reset the empty-listpays-sweep counter when CLN reports any non-
-/// empty `listpays` payload for this payment hash. Even if the
-/// status is `pending`, we don't want a transient empty response
-/// later to count toward the refund threshold.
-pub async fn reset_empty_listpays_sweeps(
-    pool: &Pool,
-    user_id: i64,
-    payment_hash: &str,
-) -> Result<()> {
+/// An observation for an old attempt must never reset a newer attempt's counter.
+pub async fn reset_empty_listpays_sweeps(pool: &Pool, payment_id: i64) -> Result<()> {
     sqlx::query(
-        "UPDATE payments \
-         SET empty_listpays_sweeps = 0 \
-         WHERE user_id = ? AND payment_hash = ? AND status = 'external_pending'",
+        "UPDATE payments SET empty_listpays_sweeps=0 WHERE id=? AND status='external_pending'",
     )
-    .bind(user_id)
-    .bind(payment_hash)
+    .bind(payment_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -1042,25 +978,24 @@ pub async fn reset_empty_listpays_sweeps(
 
 /// Snapshot of a pending external payment used by the reconciler.
 ///
-/// `#[allow(dead_code)]` on `created_at` because it's selected for
-/// future diagnostics (age-of-pending logging) but isn't currently
-/// read by the reconciler.
+/// Row IDs and RPC labels keep delayed results attached to their original attempt.
 pub struct PendingPayment {
+    pub id: i64,
+    pub cln_label: Option<String>,
     pub user_id: i64,
     pub payment_hash: String,
     pub amount_msat: i64,
     /// The reserved fee buffer (stored in `payments.fee_msat` until
     /// settle replaces it with the actual fee).
     pub fee_reserve_msat: i64,
-    #[allow(dead_code)]
     pub created_at: i64,
 }
 
 /// All payments still in `external_pending`. The reconciler enumerates
 /// these and asks CLN's `listpays` what really happened to each.
 pub async fn list_pending_external(pool: &Pool) -> Result<Vec<PendingPayment>> {
-    let rows: Vec<(i64, String, i64, i64, i64)> = sqlx::query_as(
-        "SELECT user_id, payment_hash, amount_msat, fee_msat, created_at \
+    let rows: Vec<(i64, i64, String, i64, i64, i64, Option<String>)> = sqlx::query_as(
+        "SELECT id, user_id, payment_hash, amount_msat, fee_msat, created_at, cln_label \
          FROM payments WHERE status = 'external_pending'",
     )
     .fetch_all(pool)
@@ -1068,12 +1003,16 @@ pub async fn list_pending_external(pool: &Pool) -> Result<Vec<PendingPayment>> {
     Ok(rows
         .into_iter()
         .map(
-            |(user_id, payment_hash, amount_msat, fee_reserve_msat, created_at)| PendingPayment {
-                user_id,
-                payment_hash,
-                amount_msat,
-                fee_reserve_msat,
-                created_at,
+            |(id, user_id, payment_hash, amount_msat, fee_reserve_msat, created_at, cln_label)| {
+                PendingPayment {
+                    id,
+                    cln_label,
+                    user_id,
+                    payment_hash,
+                    amount_msat,
+                    fee_reserve_msat,
+                    created_at,
+                }
             },
         )
         .collect())
@@ -1336,6 +1275,18 @@ pub(crate) mod tests {
         .unwrap();
     }
 
+    async fn payment_id(pool: &Pool, user: i64, hash: &str) -> i64 {
+        let (id,): (i64,) = sqlx::query_as(
+            "SELECT id FROM payments WHERE user_id=? AND payment_hash=? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(user)
+        .bind(hash)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        id
+    }
+
     // ---------- users ----------
 
     #[tokio::test]
@@ -1368,6 +1319,65 @@ pub(crate) mod tests {
             .unwrap();
         assert!(matches!(result, ReserveResult::AlreadyAttempted));
         assert_eq!(balance_msat(&pool, bob).await.unwrap(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn stale_attempt_cannot_finalize_or_reset_a_retry() {
+        let pool = fresh_pool().await;
+        let user = make_user(&pool, "payer").await;
+        seed_balance(&pool, user, 100_000).await;
+        reserve_external_pay(&pool, user, "same", "lnbc", "", 30_000, 5000)
+            .await
+            .unwrap();
+        let old = list_pending_external(&pool).await.unwrap().pop().unwrap();
+        assert!(fail_external_pay(&pool, old.id).await.unwrap());
+        reserve_external_pay(&pool, user, "same", "lnbc", "", 70_000, 5000)
+            .await
+            .unwrap();
+        let new = list_pending_external(&pool).await.unwrap().pop().unwrap();
+        assert_ne!(old.id, new.id);
+        assert_ne!(old.cln_label, new.cln_label);
+        assert_eq!(bump_empty_listpays_sweeps(&pool, new.id).await.unwrap(), 1);
+        assert!(!fail_external_pay(&pool, old.id).await.unwrap());
+        assert!(!settle_external_pay(&pool, old.id, "old receipt", 0)
+            .await
+            .unwrap());
+        assert_eq!(bump_empty_listpays_sweeps(&pool, old.id).await.unwrap(), 0);
+        reset_empty_listpays_sweeps(&pool, old.id).await.unwrap();
+        assert_eq!(bump_empty_listpays_sweeps(&pool, new.id).await.unwrap(), 2);
+        assert_eq!(balance_msat(&pool, user).await.unwrap(), 25_000);
+        assert!(fail_external_pay(&pool, new.id).await.unwrap());
+        assert_eq!(balance_msat(&pool, user).await.unwrap(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn concurrent_reservations_share_one_balance_across_connections() {
+        let path = std::env::temp_dir().join(format!("cln-hub-concurrent-{}.db", random_hex(8)));
+        let pool = init(&path).await.unwrap();
+        let user = make_user(&pool, "payer").await;
+        seed_balance(&pool, user, 100_000).await;
+        let (first, second) = tokio::join!(
+            reserve_external_pay(&pool, user, "first", "lnbc", "", 60_000, 0),
+            reserve_external_pay(&pool, user, "second", "lnbc", "", 60_000, 0),
+        );
+        let results = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, ReserveResult::Reserved { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, ReserveResult::InsufficientBalance { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(balance_msat(&pool, user).await.unwrap(), 40_000);
+        pool.close().await;
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
@@ -1473,7 +1483,7 @@ pub(crate) mod tests {
         let result = reserve_external_pay(&pool, alice, "rh1", "lnbc", "m", 50_000, 1_000)
             .await
             .unwrap();
-        assert!(matches!(result, ReserveResult::Reserved));
+        assert!(matches!(result, ReserveResult::Reserved { .. }));
         // Reserve debited amount + fee_reserve.
         assert_eq!(balance_msat(&pool, alice).await.unwrap(), 49_000);
     }
@@ -1530,9 +1540,14 @@ pub(crate) mod tests {
         // After reserve: 100k - (50k + 10k) = 40k.
         assert_eq!(balance_msat(&pool, alice).await.unwrap(), 40_000);
 
-        let settled = settle_external_pay(&pool, alice, "rh4", "preimage_hex", 3_000, 10_000)
-            .await
-            .unwrap();
+        let settled = settle_external_pay(
+            &pool,
+            payment_id(&pool, alice, "rh4").await,
+            "preimage_hex",
+            3_000,
+        )
+        .await
+        .unwrap();
         assert!(settled, "first settle should report true");
         // 7k of 10k reserve refunded → 40k + 7k = 47k.
         assert_eq!(balance_msat(&pool, alice).await.unwrap(), 47_000);
@@ -1546,9 +1561,14 @@ pub(crate) mod tests {
         reserve_external_pay(&pool, alice, "rh5", "lnbc", "m", 50_000, 10_000)
             .await
             .unwrap();
-        let settled = settle_external_pay(&pool, alice, "rh5", "preimage", 10_000, 10_000)
-            .await
-            .unwrap();
+        let settled = settle_external_pay(
+            &pool,
+            payment_id(&pool, alice, "rh5").await,
+            "preimage",
+            10_000,
+        )
+        .await
+        .unwrap();
         assert!(settled);
         // 10k reserve all consumed by fees → no refund. 40k stands.
         assert_eq!(balance_msat(&pool, alice).await.unwrap(), 40_000);
@@ -1565,15 +1585,17 @@ pub(crate) mod tests {
         reserve_external_pay(&pool, alice, "rh4b", "lnbc", "m", 50_000, 10_000)
             .await
             .unwrap();
-        let first = settle_external_pay(&pool, alice, "rh4b", "pre", 3_000, 10_000)
-            .await
-            .unwrap();
+        let first =
+            settle_external_pay(&pool, payment_id(&pool, alice, "rh4b").await, "pre", 3_000)
+                .await
+                .unwrap();
         assert!(first);
         let before = balance_msat(&pool, alice).await.unwrap();
 
-        let second = settle_external_pay(&pool, alice, "rh4b", "pre", 3_000, 10_000)
-            .await
-            .unwrap();
+        let second =
+            settle_external_pay(&pool, payment_id(&pool, alice, "rh4b").await, "pre", 3_000)
+                .await
+                .unwrap();
         assert!(
             !second,
             "second settle should report false (already finalized)"
@@ -1592,7 +1614,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(balance_msat(&pool, alice).await.unwrap(), 40_000);
 
-        let failed = fail_external_pay(&pool, alice, "rh6", 50_000, 10_000)
+        let failed = fail_external_pay(&pool, payment_id(&pool, alice, "rh6").await)
             .await
             .unwrap();
         assert!(failed);
@@ -1608,13 +1630,13 @@ pub(crate) mod tests {
         reserve_external_pay(&pool, alice, "rh6b", "lnbc", "m", 50_000, 10_000)
             .await
             .unwrap();
-        let first = fail_external_pay(&pool, alice, "rh6b", 50_000, 10_000)
+        let first = fail_external_pay(&pool, payment_id(&pool, alice, "rh6b").await)
             .await
             .unwrap();
         assert!(first);
         let before = balance_msat(&pool, alice).await.unwrap();
 
-        let second = fail_external_pay(&pool, alice, "rh6b", 50_000, 10_000)
+        let second = fail_external_pay(&pool, payment_id(&pool, alice, "rh6b").await)
             .await
             .unwrap();
         assert!(!second, "second fail should be a no-op");
@@ -1630,21 +1652,21 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let a = bump_empty_listpays_sweeps(&pool, alice, "rh7")
+        let a = bump_empty_listpays_sweeps(&pool, payment_id(&pool, alice, "rh7").await)
             .await
             .unwrap();
-        let b = bump_empty_listpays_sweeps(&pool, alice, "rh7")
+        let b = bump_empty_listpays_sweeps(&pool, payment_id(&pool, alice, "rh7").await)
             .await
             .unwrap();
-        let c = bump_empty_listpays_sweeps(&pool, alice, "rh7")
+        let c = bump_empty_listpays_sweeps(&pool, payment_id(&pool, alice, "rh7").await)
             .await
             .unwrap();
         assert_eq!((a, b, c), (1, 2, 3));
 
-        reset_empty_listpays_sweeps(&pool, alice, "rh7")
+        reset_empty_listpays_sweeps(&pool, payment_id(&pool, alice, "rh7").await)
             .await
             .unwrap();
-        let after_reset = bump_empty_listpays_sweeps(&pool, alice, "rh7")
+        let after_reset = bump_empty_listpays_sweeps(&pool, payment_id(&pool, alice, "rh7").await)
             .await
             .unwrap();
         assert_eq!(after_reset, 1, "reset should zero the counter");
@@ -1661,11 +1683,11 @@ pub(crate) mod tests {
         reserve_external_pay(&pool, alice, "rh8", "lnbc", "m", 50_000, 10_000)
             .await
             .unwrap();
-        settle_external_pay(&pool, alice, "rh8", "pre", 3_000, 10_000)
+        settle_external_pay(&pool, payment_id(&pool, alice, "rh8").await, "pre", 3_000)
             .await
             .unwrap();
 
-        let n = bump_empty_listpays_sweeps(&pool, alice, "rh8")
+        let n = bump_empty_listpays_sweeps(&pool, payment_id(&pool, alice, "rh8").await)
             .await
             .unwrap();
         assert_eq!(n, 0, "settled row's sweep counter must stay at 0");
@@ -1727,11 +1749,9 @@ pub(crate) mod tests {
             .unwrap();
         settle_external_pay(
             &pool,
-            alice,
-            "ok_hash",
+            payment_id(&pool, alice, "ok_hash").await,
             "00000000000000000000000000000000000000000000000000000000aaaaaaaa",
             500,
-            1_000,
         )
         .await
         .unwrap();
@@ -1748,7 +1768,7 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        fail_external_pay(&pool, alice, "fail_hash", 20_000, 2_000)
+        fail_external_pay(&pool, payment_id(&pool, alice, "fail_hash").await)
             .await
             .unwrap();
 
@@ -1779,9 +1799,14 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        settle_external_pay(&pool, alice, "inv_internal", "receipt", 0, 0)
-            .await
-            .unwrap();
+        settle_external_pay(
+            &pool,
+            payment_id(&pool, alice, "inv_internal").await,
+            "receipt",
+            0,
+        )
+        .await
+        .unwrap();
 
         let rows = payments::list_for_user(&pool, alice).await.unwrap();
         let hashes: Vec<&str> = rows.iter().map(|r| r.payment_hash.as_str()).collect();

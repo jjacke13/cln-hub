@@ -190,7 +190,7 @@ async fn external_pay(
 
     // ---- 1. Reserve (atomic: balance check + pending row + ledger debit). ----
     use db::ReserveResult::*;
-    match db::reserve_external_pay(
+    let (payment_id, cln_label) = match db::reserve_external_pay(
         &state.db,
         user_id,
         payment_hash,
@@ -201,7 +201,10 @@ async fn external_pay(
     )
     .await?
     {
-        Reserved => {}
+        Reserved {
+            payment_id,
+            cln_label,
+        } => (payment_id, cln_label),
         InsufficientBalance {
             balance_msat,
             required_msat,
@@ -220,7 +223,7 @@ async fn external_pay(
                 "a payment to this invoice is already in progress or completed",
             ))
         }
-    }
+    };
 
     // ---- 2. Call CLN `pay`. ----
     //
@@ -245,6 +248,7 @@ async fn external_pay(
     let mut pay_params = json!({
         "bolt11": bolt11,
         "maxfee": fee_reserve_msat,
+        "label": cln_label,
     });
     if invoice_is_amountless {
         pay_params["amount_msat"] = json!(amount_msat);
@@ -278,15 +282,8 @@ async fn external_pay(
             // an error: the money is already settled the way we wanted.
             // We still return the success body to the client because we
             // hold a valid preimage from CLN.
-            let newly_settled = db::settle_external_pay(
-                &state.db,
-                user_id,
-                payment_hash,
-                &preimage,
-                actual_fee_msat,
-                fee_reserve_msat,
-            )
-            .await?;
+            let newly_settled =
+                db::settle_external_pay(&state.db, payment_id, &preimage, actual_fee_msat).await?;
 
             if newly_settled {
                 log::info!(
@@ -337,14 +334,7 @@ async fn external_pay(
                 user_id,
                 payment_hash
             );
-            let newly_failed = db::fail_external_pay(
-                &state.db,
-                user_id,
-                payment_hash,
-                amount_msat,
-                fee_reserve_msat,
-            )
-            .await?;
+            let newly_failed = db::fail_external_pay(&state.db, payment_id).await?;
             if !newly_failed {
                 log::info!(
                     "external pay: handler fail no-op (already finalized by reconciler) user={} hash={}",
@@ -478,7 +468,7 @@ mod amount_tests {
             ),
             (
                 "pay",
-                json!({"bolt11": "lnbc-test", "maxfee": 0}),
+                json!({"bolt11": "lnbc-test", "maxfee": 0, "label": "cln-hub:payment:1"}),
                 json!({"payment_preimage": preimage, "amount_sent_msat": 30_000}),
             ),
         ])

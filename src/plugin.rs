@@ -277,6 +277,62 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn reconciler_matches_the_current_attempt_label() {
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "payer").await;
+        db::tests::seed_balance(&pool, user, 100_000).await;
+        db::reserve_external_pay(&pool, user, "same", "lnbc", "", 30_000, 5000)
+            .await
+            .unwrap();
+        let old = db::list_pending_external(&pool)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        db::fail_external_pay(&pool, old.id).await.unwrap();
+        db::reserve_external_pay(&pool, user, "same", "lnbc", "", 70_000, 5000)
+            .await
+            .unwrap();
+        let new = db::list_pending_external(&pool)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let old_status =
+            json!({"payment_hash": "same", "label": old.cln_label, "status": "failed"});
+        let paid_status = json!({"payment_hash": "same", "label": new.cln_label, "status": "complete",
+            "preimage": "ab".repeat(32), "amount_sent_msat": 72_000});
+        let (path, server) = crate::test_support::rpc(vec![
+            (
+                "listpays",
+                json!({"payment_hash": "same"}),
+                json!({"pays": [old_status.clone()]}),
+            ),
+            (
+                "listpays",
+                json!({"payment_hash": "same"}),
+                json!({"pays": [old_status, paid_status]}),
+            ),
+        ])
+        .await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        };
+        reconcile_one(&state, &new).await.unwrap();
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 25_000);
+        assert_eq!(
+            db::list_pending_external(&pool).await.unwrap()[0].id,
+            new.id
+        );
+        reconcile_one(&state, &new).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 28_000);
+        assert!(db::list_pending_external(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn malformed_listpays_never_refunds_or_counts_as_empty() {
         let pool = db::tests::fresh_pool().await;
         let user = db::tests::make_user(&pool, "payer").await;
@@ -429,7 +485,7 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
     .await?;
 
     let Some(pays) = resp.get("pays").and_then(Value::as_array) else {
-        db::reset_empty_listpays_sweeps(&state.db, p.user_id, &p.payment_hash).await?;
+        db::reset_empty_listpays_sweeps(&state.db, p.id).await?;
         anyhow::bail!("listpays response missing pays array; leaving payment pending");
     };
     if pays.iter().any(|pay| {
@@ -439,9 +495,25 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
                 Some("complete" | "failed" | "pending")
             )
     }) {
-        db::reset_empty_listpays_sweeps(&state.db, p.user_id, &p.payment_hash).await?;
+        db::reset_empty_listpays_sweeps(&state.db, p.id).await?;
         anyhow::bail!("listpays returned an invalid payment record; leaving payment pending");
     }
+
+    // A failed previous attempt is not evidence that this attempt failed.
+    let matching: Vec<&Value> = pays
+        .iter()
+        .filter(|pay| {
+            p.cln_label
+                .as_deref()
+                .is_none_or(|label| pay["label"].as_str() == Some(label))
+        })
+        .collect();
+    if p.cln_label.is_some() && matching.is_empty() && pays.iter().any(|pay| pay["label"].is_null())
+    {
+        db::reset_empty_listpays_sweeps(&state.db, p.id).await?;
+        anyhow::bail!("listpays omitted attempt labels; leaving payment pending");
+    }
+    let pays = matching;
 
     // ---- Empty listpays: handle very conservatively. ----
     //
@@ -473,7 +545,7 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
             return Ok(());
         }
 
-        let sweeps = db::bump_empty_listpays_sweeps(&state.db, p.user_id, &p.payment_hash).await?;
+        let sweeps = db::bump_empty_listpays_sweeps(&state.db, p.id).await?;
 
         if sweeps < MIN_EMPTY_SWEEPS_BEFORE_REFUND {
             log::info!(
@@ -491,14 +563,7 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
             sweeps,
             age
         );
-        let refunded = db::fail_external_pay(
-            &state.db,
-            p.user_id,
-            &p.payment_hash,
-            p.amount_msat,
-            p.fee_reserve_msat,
-        )
-        .await?;
+        let refunded = db::fail_external_pay(&state.db, p.id).await?;
         if !refunded {
             log::info!(
                 "reconcile: hash={} fail no-op — row finalized by another path",
@@ -511,7 +576,7 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
     // CLN returned a real listpays entry — clear the empty-sweep
     // counter regardless of status. We only refund on SUSTAINED
     // empty streaks, not interleaved flicker.
-    db::reset_empty_listpays_sweeps(&state.db, p.user_id, &p.payment_hash).await?;
+    db::reset_empty_listpays_sweeps(&state.db, p.id).await?;
 
     // Take the LAST attempt (most recent). CLN appends; oldest first.
     // `let-else` so a future refactor that breaks the `is_empty` guard
@@ -547,15 +612,8 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
             };
             let actual_fee_msat = cln::payment_fee_msat(last, p.amount_msat, p.fee_reserve_msat)?;
 
-            let settled = db::settle_external_pay(
-                &state.db,
-                p.user_id,
-                &p.payment_hash,
-                &preimage,
-                actual_fee_msat,
-                p.fee_reserve_msat,
-            )
-            .await?;
+            let settled =
+                db::settle_external_pay(&state.db, p.id, &preimage, actual_fee_msat).await?;
 
             if settled {
                 log::info!(
@@ -573,14 +631,7 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
             }
         }
         "failed" => {
-            let failed = db::fail_external_pay(
-                &state.db,
-                p.user_id,
-                &p.payment_hash,
-                p.amount_msat,
-                p.fee_reserve_msat,
-            )
-            .await?;
+            let failed = db::fail_external_pay(&state.db, p.id).await?;
             if failed {
                 log::info!(
                     "reconcile: failed hash={} user={} — refunded",

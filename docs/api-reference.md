@@ -180,6 +180,8 @@ cln-hub picks one of two paths automatically:
 
 `amount` (in satoshis) is required only for amountless BOLT11s and ignored otherwise.
 
+Each outgoing attempt has its own database ID and CLN label. Recovery only finalizes that attempt and reads refunds from its stored reservation, so a delayed result cannot change a newer retry. A hash already pending or successfully paid by any hub user is refused before CLN is called.
+
 **Response 200 — success:**
 
 ```json
