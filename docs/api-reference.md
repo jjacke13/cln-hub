@@ -117,7 +117,7 @@ Send `Authorization: Bearer <access_token>` with every request. A missing, malfo
 
 ### `POST /addinvoice`
 
-Issue a BOLT11 invoice owned by the calling user. When this invoice is paid (by anyone, externally or via the hub's internal short-circuit), the amount is credited to the caller's ledger.
+Issue a BOLT11 invoice owned by the calling user. When this invoice is paid externally or by another hub user, the amount is credited to the caller's ledger.
 
 **Request body:**
 
@@ -169,7 +169,7 @@ Pay a BOLT11 invoice from the calling user's balance.
 
 cln-hub picks one of two paths automatically:
 
-- **Internal short-circuit** — if the invoice was issued by another user on this same hub, settlement happens atomically inside cln-hub. No Lightning HTLC, no fee.
+- **Internal transfer** — if the invoice was issued by another user on this same hub, CLN settles its own invoice directly. No channel or routing fee is needed. Both the node and hub record payment, preventing the invoice from being paid a second time externally.
 - **External pay** — otherwise, cln-hub reserves the amount plus a small fee buffer, asks CLN to pay over Lightning, then settles or refunds depending on the outcome.
 
 **Request body:**
@@ -202,7 +202,7 @@ cln-hub picks one of two paths automatically:
 }
 ```
 
-For internal payments the `payment_preimage` is all zeros (no real preimage exists when the payment never touches the Lightning network).
+Internal transfers return CLN's real `payment_preimage`, just like external payments. Historical internal transfers made by older versions can still have an all-zero placeholder.
 
 **Error responses:**
 
@@ -255,7 +255,7 @@ List the calling user's outbound Lightning payments and confirmed on-chain depos
 }
 ```
 
-`status` is either `internal` (hub-to-hub short-circuit, no Lightning HTLC) or `external_settled` (paid over Lightning). Internal payments report `payment_preimage` as 64 zeros — no real preimage exists when the payment never touches the network.
+`status` is either `internal` (hub-to-hub transfer) or `external_settled` (paid over Lightning). New internal payments have a real preimage; historical internal payments may still report 64 zeros.
 
 **`type: "bitcoind_tx"`** — a confirmed on-chain deposit to the caller's `/getbtc` address, in LndHub's canonical shape:
 

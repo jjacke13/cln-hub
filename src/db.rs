@@ -107,7 +107,9 @@ pub mod users {
     use super::{anyhow, unix_now, Pool, Result};
 
     use argon2::password_hash::{rand_core::OsRng, SaltString};
-    use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
+    use argon2::{
+        Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version,
+    };
 
     /// Argon2id parameters used for password hashing.
     ///
@@ -155,14 +157,13 @@ pub mod users {
         // `.bind(x)` adds a positional parameter (matches a `?` in the
         // SQL). This avoids string interpolation, which would be a
         // SQL-injection footgun.
-        let result = sqlx::query(
-            "INSERT INTO users (login, password_hash, created_at) VALUES (?, ?, ?)",
-        )
-        .bind(login)
-        .bind(&hash)
-        .bind(unix_now())
-        .execute(pool)
-        .await?;
+        let result =
+            sqlx::query("INSERT INTO users (login, password_hash, created_at) VALUES (?, ?, ?)")
+                .bind(login)
+                .bind(&hash)
+                .bind(unix_now())
+                .execute(pool)
+                .await?;
 
         Ok(result.last_insert_rowid())
     }
@@ -187,8 +188,8 @@ pub mod users {
             return Ok(None); // no such login
         };
 
-        let parsed = PasswordHash::new(&hash)
-            .map_err(|e| anyhow!("password hash parse failure: {}", e))?;
+        let parsed =
+            PasswordHash::new(&hash).map_err(|e| anyhow!("password hash parse failure: {}", e))?;
 
         // `verify_password` re-derives the hasher from the PHC string,
         // so old hashes created with previous params still verify
@@ -247,14 +248,14 @@ pub mod users {
             // verbatim — the PHC string encodes m=19456, t=2, p=1.
             let phc = "$argon2id$v=19$m=19456,t=2,p=1$0ZiZsGrsNc6XnFyEv8aPEQ$aVKb2RkFjQEW7lIkWR6DBiA2X1pk3owcUhiMz/4GRcY";
             let parsed = PasswordHash::new(phc).expect("parse old PHC");
-            assert!(argon2()
-                .verify_password(b"s3cret", &parsed)
-                .is_ok(),
-                "old hashes must keep verifying after param bump");
-            assert!(argon2()
-                .verify_password(b"WRONG", &parsed)
-                .is_err(),
-                "wrong password against old hash must still fail");
+            assert!(
+                argon2().verify_password(b"s3cret", &parsed).is_ok(),
+                "old hashes must keep verifying after param bump"
+            );
+            assert!(
+                argon2().verify_password(b"WRONG", &parsed).is_err(),
+                "wrong password against old hash must still fail"
+            );
         }
     }
 }
@@ -493,6 +494,15 @@ pub mod invoices {
         Ok(row.map(from_tuple))
     }
 
+    pub async fn find_by_hash(pool: &Pool, hash: &str) -> Result<Option<Row>> {
+        let query = format!("SELECT {SELECT_COLS} FROM invoices WHERE payment_hash = ?");
+        let row: Option<RowTuple> = sqlx::query_as(&query)
+            .bind(hash)
+            .fetch_optional(pool)
+            .await?;
+        Ok(row.map(from_tuple))
+    }
+
     /// List a user's invoices, newest first.
     pub async fn list_for_user(pool: &Pool, user_id: i64) -> Result<Vec<Row>> {
         let q = format!(
@@ -504,7 +514,8 @@ pub mod invoices {
 
     /// Notifications can be missed during downtime; reconcile these against CLN.
     pub async fn list_unsettled(pool: &Pool) -> Result<Vec<Row>> {
-        let query = format!("SELECT {SELECT_COLS} FROM invoices WHERE settled_at IS NULL");
+        let query = format!("SELECT {SELECT_COLS} FROM invoices WHERE NOT EXISTS \
+            (SELECT 1 FROM invoice_receipts WHERE invoice_receipts.payment_hash = invoices.payment_hash)");
         let rows: Vec<RowTuple> = sqlx::query_as(&query).fetch_all(pool).await?;
         Ok(rows.into_iter().map(from_tuple).collect())
     }
@@ -622,14 +633,12 @@ pub mod addresses {
     /// already has one (the UNIQUE PRIMARY KEY on user_id catches it),
     /// which the caller should handle by re-reading via `for_user`.
     pub async fn create(pool: &Pool, user_id: i64, address: &str) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO addresses (user_id, address, created_at) VALUES (?, ?, ?)",
-        )
-        .bind(user_id)
-        .bind(address)
-        .bind(unix_now())
-        .execute(pool)
-        .await?;
+        sqlx::query("INSERT INTO addresses (user_id, address, created_at) VALUES (?, ?, ?)")
+            .bind(user_id)
+            .bind(address)
+            .bind(unix_now())
+            .execute(pool)
+            .await?;
         Ok(())
     }
 }
@@ -675,8 +684,7 @@ pub mod onchain_credits {
         }
     }
 
-    const SELECT_COLS: &str =
-        "txid, vout, user_id, address, amount_msat, blockheight, credited_at";
+    const SELECT_COLS: &str = "txid, vout, user_id, address, amount_msat, blockheight, credited_at";
 
     /// List one user's confirmed on-chain credits, newest first.
     pub async fn list_for_user(pool: &Pool, user_id: i64) -> Result<Vec<Row>> {
@@ -707,174 +715,6 @@ pub async fn balance_msat(pool: &Pool, user_id: i64) -> Result<i64> {
 }
 
 // =====================================================================
-// Internal payment (one local user pays another's invoice)
-// =====================================================================
-
-/// Outcome of an internal-payment attempt.
-///
-/// `try_settle_internal` returns one of these instead of bubbling
-/// every condition up as an `Err`, so the HTTP handler can map each
-/// case to the right LndHub status code and message.
-pub enum InternalPayResult {
-    /// Settled atomically. Receiver got `amount_msat`; their invoice
-    /// is now marked paid.
-    Settled { receiver_user_id: i64 },
-    /// `payment_hash` is not in our `invoices` table — caller should
-    /// fall through to the external CLN `pay` path (slice 5b).
-    NotOurInvoice,
-    /// Invoice exists but has already been settled.
-    AlreadyPaid,
-    /// Sender and receiver are the same user. Refused.
-    SelfPayment,
-    /// Sender's balance is below the invoice amount.
-    InsufficientBalance { balance_msat: i64 },
-}
-
-/// Try to settle a payment entirely inside our database, without
-/// asking CLN to pay anything.
-///
-/// === The transaction ===
-///
-/// All steps run inside a single `BEGIN IMMEDIATE` SQLite transaction
-/// so a crash partway through (or two concurrent payments racing)
-/// cannot leave the ledger inconsistent. Either everything commits
-/// or nothing does.
-///
-/// 1. Look up the invoice by `payment_hash`. Bail with `NotOurInvoice`
-///    if absent (caller goes to the external path).
-/// 2. Check it's unpaid. If not, `AlreadyPaid`.
-/// 3. Refuse self-payment.
-/// 4. Compute the payer's balance INSIDE the transaction. If it's less
-///    than the amount, `InsufficientBalance`.
-/// 5. Mark the invoice settled (`UPDATE ... WHERE settled_at IS NULL`).
-///    This re-checks idempotency at commit time; if a concurrent
-///    notification raced us, our UPDATE matches zero rows and we
-///    return `AlreadyPaid`.
-/// 6. Insert a `payments` row owned by the payer (status='internal').
-/// 7. Insert two ledger entries: `internal_out` (debit payer) and
-///    `internal_in` (credit receiver).
-/// 8. Commit.
-pub async fn try_settle_internal(
-    pool: &Pool,
-    payer_user_id: i64,
-    payment_hash: &str,
-    bolt11: &str,
-    amount_msat: i64,
-    memo: &str,
-) -> Result<InternalPayResult> {
-    crate::amount::reserve_total(amount_msat, 0)?;
-    let mut tx = pool.begin().await?;
-
-    // (1) Find the invoice.
-    let row: Option<(i64, Option<i64>)> = sqlx::query_as(
-        "SELECT user_id, settled_at FROM invoices WHERE payment_hash = ?",
-    )
-    .bind(payment_hash)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let Some((receiver_user_id, settled_at)) = row else {
-        tx.rollback().await?;
-        return Ok(InternalPayResult::NotOurInvoice);
-    };
-
-    // (2) Already paid?
-    if settled_at.is_some() {
-        tx.rollback().await?;
-        return Ok(InternalPayResult::AlreadyPaid);
-    }
-
-    // (3) Self-pay refused.
-    if receiver_user_id == payer_user_id {
-        tx.rollback().await?;
-        return Ok(InternalPayResult::SelfPayment);
-    }
-
-    // (4) Balance check inside the transaction.
-    let (balance,): (i64,) = sqlx::query_as(
-        "SELECT COALESCE(SUM(amount_msat), 0) FROM ledger WHERE user_id = ?",
-    )
-    .bind(payer_user_id)
-    .fetch_one(&mut *tx)
-    .await?;
-
-    if balance < amount_msat {
-        tx.rollback().await?;
-        return Ok(InternalPayResult::InsufficientBalance {
-            balance_msat: balance,
-        });
-    }
-
-    let now = unix_now();
-
-    // (5) Mark invoice settled. The conditional WHERE re-asserts
-    //     idempotency in case a concurrent settle raced us.
-    let updated = sqlx::query(
-        "UPDATE invoices SET settled_at = ?, settled_msat = ? \
-         WHERE payment_hash = ? AND settled_at IS NULL",
-    )
-    .bind(now)
-    .bind(amount_msat)
-    .bind(payment_hash)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-
-    if updated == 0 {
-        // Lost the race.
-        tx.rollback().await?;
-        return Ok(InternalPayResult::AlreadyPaid);
-    }
-
-    // (6) Record the payment from the payer's POV.
-    sqlx::query(
-        "INSERT INTO payments \
-            (payment_hash, user_id, bolt11, amount_msat, fee_msat, preimage, status, memo, created_at, settled_at) \
-         VALUES (?, ?, ?, ?, 0, NULL, 'internal', ?, ?, ?)",
-    )
-    .bind(payment_hash)
-    .bind(payer_user_id)
-    .bind(bolt11)
-    .bind(amount_msat)
-    .bind(memo)
-    .bind(now)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-
-    // (7a) Debit the payer.
-    sqlx::query(
-        "INSERT INTO ledger (user_id, kind, amount_msat, ref_hash, description, created_at) \
-         VALUES (?, 'internal_out', ?, ?, ?, ?)",
-    )
-    .bind(payer_user_id)
-    .bind(-amount_msat)
-    .bind(payment_hash)
-    .bind(memo)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-
-    // (7b) Credit the receiver.
-    sqlx::query(
-        "INSERT INTO ledger (user_id, kind, amount_msat, ref_hash, description, created_at) \
-         VALUES (?, 'internal_in', ?, ?, ?, ?)",
-    )
-    .bind(receiver_user_id)
-    .bind(amount_msat)
-    .bind(payment_hash)
-    .bind(memo)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
-
-    // (8) All-or-nothing commit.
-    tx.commit().await?;
-
-    Ok(InternalPayResult::Settled { receiver_user_id })
-}
-
-// =====================================================================
 // External Lightning payment (slice 5b)
 // =====================================================================
 
@@ -894,8 +734,8 @@ pub enum ReserveResult {
         balance_msat: i64,
         required_msat: i64,
     },
-    /// A row for this (user, payment_hash) already exists in
-    /// 'external_pending' or terminal state. Refuse a second attempt.
+    /// This node already has an active/successful payment for the hash,
+    /// even if a different hub user initiated it.
     AlreadyAttempted,
 }
 
@@ -927,17 +767,29 @@ pub async fn reserve_external_pay(
     fee_reserve_msat: i64,
 ) -> Result<ReserveResult> {
     let total = crate::amount::reserve_total(amount_msat, fee_reserve_msat)?;
-    let mut tx = pool.begin().await?;
+    // Serialize balance checks and hash ownership before any CLN side effect.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let now = unix_now();
+
+    let (attempted,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM payments WHERE payment_hash = ? \
+         AND status IN ('internal', 'external_settled', 'external_pending'))",
+    )
+    .bind(payment_hash)
+    .fetch_one(&mut *tx)
+    .await?;
+    if attempted {
+        tx.rollback().await?;
+        return Ok(ReserveResult::AlreadyAttempted);
+    }
 
     // (1) Balance check INSIDE the tx — without this, two concurrent
     //     reserves could each pass and we'd overdraft.
-    let (balance,): (i64,) = sqlx::query_as(
-        "SELECT COALESCE(SUM(amount_msat), 0) FROM ledger WHERE user_id = ?",
-    )
-    .bind(user_id)
-    .fetch_one(&mut *tx)
-    .await?;
+    let (balance,): (i64,) =
+        sqlx::query_as("SELECT COALESCE(SUM(amount_msat), 0) FROM ledger WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
 
     if balance < total {
         tx.rollback().await?;
@@ -1025,14 +877,17 @@ pub async fn settle_external_pay(
     actual_fee_msat: i64,
     fee_reserve_msat: i64,
 ) -> Result<bool> {
-    anyhow::ensure!(actual_fee_msat >= 0 && actual_fee_msat <= fee_reserve_msat,
-        "actual fee exceeds reserved fee");
+    anyhow::ensure!(
+        actual_fee_msat >= 0 && actual_fee_msat <= fee_reserve_msat,
+        "actual fee exceeds reserved fee"
+    );
     let mut tx = pool.begin().await?;
     let now = unix_now();
 
     let updated = sqlx::query(
         "UPDATE payments \
-         SET status = 'external_settled', preimage = ?, fee_msat = ?, settled_at = ? \
+         SET status = CASE WHEN EXISTS(SELECT 1 FROM invoices WHERE invoices.payment_hash = payments.payment_hash) \
+             THEN 'internal' ELSE 'external_settled' END, preimage = ?, fee_msat = ?, settled_at = ? \
          WHERE payment_hash = ? AND user_id = ? AND status = 'external_pending'",
     )
     .bind(preimage)
@@ -1310,43 +1165,43 @@ pub async fn credit_onchain(
 ///
 /// === Idempotency ===
 ///
-/// The conditional `WHERE settled_at IS NULL` makes this safe to
-/// retry. If the notification fires twice (or we crash and restart),
-/// the second pass UPDATEs zero rows, so we skip the credit and
-/// nobody gets double-paid.
-pub async fn settle_invoice(
-    pool: &Pool,
-    payment_hash: &str,
-    settled_msat: i64,
-) -> Result<bool> {
+/// The unique invoice_receipts row makes this safe to retry, including
+/// after a legacy internal transfer which never settled the CLN invoice.
+pub async fn settle_invoice(pool: &Pool, payment_hash: &str, settled_msat: i64) -> Result<bool> {
     crate::amount::reserve_total(settled_msat, 0)?;
     let mut tx = pool.begin().await?;
     let now = unix_now();
 
-    let updated = sqlx::query(
-        "UPDATE invoices SET settled_at = ?, settled_msat = ? \
-         WHERE payment_hash = ? AND settled_at IS NULL",
+    // A legacy internal transfer is not evidence of an actual CLN receipt.
+    let received = sqlx::query(
+        "INSERT OR IGNORE INTO invoice_receipts (payment_hash) \
+         SELECT payment_hash FROM invoices WHERE payment_hash = ?",
+    )
+    .bind(payment_hash)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if received == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
+    sqlx::query(
+        "UPDATE invoices SET settled_at = COALESCE(settled_at, ?), \
+         settled_msat = COALESCE(settled_msat, 0) + ? WHERE payment_hash = ?",
     )
     .bind(now)
     .bind(settled_msat)
     .bind(payment_hash)
     .execute(&mut *tx)
-    .await?
-    .rows_affected();
-
-    if updated == 0 {
-        // Either not in our table or already settled. No-op.
-        tx.rollback().await?;
-        return Ok(false);
-    }
+    .await?;
 
     // Look up the owning user inside the same tx so we know the
     // row is the one we just updated.
-    let (user_id,): (i64,) =
-        sqlx::query_as("SELECT user_id FROM invoices WHERE payment_hash = ?")
-            .bind(payment_hash)
-            .fetch_one(&mut *tx)
-            .await?;
+    let (user_id,): (i64,) = sqlx::query_as("SELECT user_id FROM invoices WHERE payment_hash = ?")
+        .bind(payment_hash)
+        .fetch_one(&mut *tx)
+        .await?;
 
     sqlx::query(
         "INSERT INTO ledger (user_id, kind, amount_msat, ref_hash, description, created_at) \
@@ -1448,7 +1303,7 @@ pub(crate) mod tests {
     /// Direct ledger insert to set up balance for spend-path tests.
     /// Bypasses every business-logic check — that's the point: we
     /// want to drive the path under test, not the seed mechanism.
-    async fn seed_balance(pool: &Pool, user_id: i64, amount_msat: i64) {
+    pub(crate) async fn seed_balance(pool: &Pool, user_id: i64, amount_msat: i64) {
         sqlx::query(
             "INSERT INTO ledger (user_id, kind, amount_msat, ref_hash, description, created_at) \
              VALUES (?, 'seed', ?, NULL, 'test seed', ?)",
@@ -1461,7 +1316,12 @@ pub(crate) mod tests {
         .unwrap();
     }
 
-    pub(crate) async fn make_invoice(pool: &Pool, owner_id: i64, payment_hash: &str, amount_msat: i64) {
+    pub(crate) async fn make_invoice(
+        pool: &Pool,
+        owner_id: i64,
+        payment_hash: &str,
+        amount_msat: i64,
+    ) {
         invoices::create(
             pool,
             payment_hash,
@@ -1483,11 +1343,83 @@ pub(crate) mod tests {
         let pool = fresh_pool().await;
         let user = make_user(&pool, "overflow").await;
         for (amount, fee) in [(i64::MAX, i64::MAX / 100), (1, -1), (0, 5000)] {
-            assert!(reserve_external_pay(&pool, user, "overflow", "lnbc", "", amount, fee)
-                .await.is_err());
+            assert!(
+                reserve_external_pay(&pool, user, "overflow", "lnbc", "", amount, fee)
+                    .await
+                    .is_err()
+            );
         }
         assert_eq!(balance_msat(&pool, user).await.unwrap(), 0);
         assert!(list_pending_external(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn another_user_cannot_be_charged_for_the_same_node_payment() {
+        let pool = fresh_pool().await;
+        let alice = make_user(&pool, "alice").await;
+        let bob = make_user(&pool, "bob").await;
+        seed_balance(&pool, alice, 100_000).await;
+        seed_balance(&pool, bob, 100_000).await;
+        reserve_external_pay(&pool, alice, "same", "lnbc", "", 10_000, 5000)
+            .await
+            .unwrap();
+        let result = reserve_external_pay(&pool, bob, "same", "lnbc", "", 10_000, 5000)
+            .await
+            .unwrap();
+        assert!(matches!(result, ReserveResult::AlreadyAttempted));
+        assert_eq!(balance_msat(&pool, bob).await.unwrap(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn external_receipt_after_legacy_internal_transfer_is_credited_once() {
+        let pool = fresh_pool().await;
+        let user = make_user(&pool, "receiver").await;
+        make_invoice(&pool, user, "legacy", 30_000).await;
+        seed_balance(&pool, user, 30_000).await;
+        sqlx::query("UPDATE invoices SET settled_at=1, settled_msat=30000")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(invoices::list_unsettled(&pool).await.unwrap().len(), 1);
+        assert!(settle_invoice(&pool, "legacy", 30_000).await.unwrap());
+        assert!(!settle_invoice(&pool, "legacy", 30_000).await.unwrap());
+        assert_eq!(balance_msat(&pool, user).await.unwrap(), 60_000);
+        assert!(invoices::list_unsettled(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn receipt_migration_does_not_recredit_existing_external_payments() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for migration in sqlx::migrate!("./migrations")
+            .iter()
+            .filter(|m| m.version <= 8)
+        {
+            sqlx::raw_sql(&migration.sql).execute(&pool).await.unwrap();
+        }
+        let user = make_user(&pool, "existing").await;
+        make_invoice(&pool, user, "paid", 30_000).await;
+        sqlx::query("UPDATE invoices SET settled_at=1, settled_msat=30000")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO ledger(user_id,kind,amount_msat,ref_hash,created_at) \
+            VALUES (?,'invoice_settled',30000,'paid',1)",
+        )
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0009_invoice_receipts.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!settle_invoice(&pool, "paid", 30_000).await.unwrap());
+        assert_eq!(balance_msat(&pool, user).await.unwrap(), 30_000);
     }
 
     #[tokio::test]
@@ -1529,96 +1461,6 @@ pub(crate) mod tests {
         seed_balance(&pool, id, 50_000).await;
         seed_balance(&pool, id, -30_000).await;
         assert_eq!(balance_msat(&pool, id).await.unwrap(), 120_000);
-    }
-
-    // ---------- try_settle_internal ----------
-
-    #[tokio::test]
-    async fn internal_pay_success() {
-        let pool = fresh_pool().await;
-        let alice = make_user(&pool, "alice").await;
-        let bob = make_user(&pool, "bob").await;
-        seed_balance(&pool, alice, 100_000).await;
-        make_invoice(&pool, bob, "h1", 30_000).await;
-
-        let result = try_settle_internal(&pool, alice, "h1", "lnbc", 30_000, "memo")
-            .await
-            .unwrap();
-        match result {
-            InternalPayResult::Settled { receiver_user_id } => assert_eq!(receiver_user_id, bob),
-            _ => panic!("expected Settled"),
-        }
-        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 70_000);
-        assert_eq!(balance_msat(&pool, bob).await.unwrap(), 30_000);
-    }
-
-    #[tokio::test]
-    async fn internal_pay_not_our_invoice() {
-        let pool = fresh_pool().await;
-        let alice = make_user(&pool, "alice").await;
-        seed_balance(&pool, alice, 100_000).await;
-        // No invoice exists for this hash.
-        let result = try_settle_internal(&pool, alice, "stranger", "lnbc", 10_000, "m")
-            .await
-            .unwrap();
-        assert!(matches!(result, InternalPayResult::NotOurInvoice));
-        // Balance untouched.
-        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 100_000);
-    }
-
-    #[tokio::test]
-    async fn internal_pay_already_paid() {
-        let pool = fresh_pool().await;
-        let alice = make_user(&pool, "alice").await;
-        let bob = make_user(&pool, "bob").await;
-        seed_balance(&pool, alice, 100_000).await;
-        make_invoice(&pool, bob, "h2", 30_000).await;
-        // First pay settles.
-        try_settle_internal(&pool, alice, "h2", "lnbc", 30_000, "m")
-            .await
-            .unwrap();
-        // Second attempt sees settled invoice.
-        let result = try_settle_internal(&pool, alice, "h2", "lnbc", 30_000, "m")
-            .await
-            .unwrap();
-        assert!(matches!(result, InternalPayResult::AlreadyPaid));
-        // No additional movement.
-        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 70_000);
-        assert_eq!(balance_msat(&pool, bob).await.unwrap(), 30_000);
-    }
-
-    #[tokio::test]
-    async fn internal_pay_self_payment_refused() {
-        let pool = fresh_pool().await;
-        let alice = make_user(&pool, "alice").await;
-        seed_balance(&pool, alice, 100_000).await;
-        make_invoice(&pool, alice, "h3", 10_000).await;
-        let result = try_settle_internal(&pool, alice, "h3", "lnbc", 10_000, "m")
-            .await
-            .unwrap();
-        assert!(matches!(result, InternalPayResult::SelfPayment));
-        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 100_000);
-    }
-
-    #[tokio::test]
-    async fn internal_pay_insufficient_balance() {
-        let pool = fresh_pool().await;
-        let alice = make_user(&pool, "alice").await;
-        let bob = make_user(&pool, "bob").await;
-        seed_balance(&pool, alice, 5_000).await;
-        make_invoice(&pool, bob, "h4", 30_000).await;
-        let result = try_settle_internal(&pool, alice, "h4", "lnbc", 30_000, "m")
-            .await
-            .unwrap();
-        match result {
-            InternalPayResult::InsufficientBalance { balance_msat: bal, .. } => {
-                assert_eq!(bal, 5_000)
-            }
-            _ => panic!("expected InsufficientBalance"),
-        }
-        // Both balances untouched.
-        assert_eq!(balance_msat(&pool, alice).await.unwrap(), 5_000);
-        assert_eq!(balance_msat(&pool, bob).await.unwrap(), 0);
     }
 
     // ---------- reserve / settle / fail external pay ----------
@@ -1732,7 +1574,10 @@ pub(crate) mod tests {
         let second = settle_external_pay(&pool, alice, "rh4b", "pre", 3_000, 10_000)
             .await
             .unwrap();
-        assert!(!second, "second settle should report false (already finalized)");
+        assert!(
+            !second,
+            "second settle should report false (already finalized)"
+        );
         // Balance must not change on the second call.
         assert_eq!(balance_msat(&pool, alice).await.unwrap(), before);
     }
@@ -1785,9 +1630,15 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let a = bump_empty_listpays_sweeps(&pool, alice, "rh7").await.unwrap();
-        let b = bump_empty_listpays_sweeps(&pool, alice, "rh7").await.unwrap();
-        let c = bump_empty_listpays_sweeps(&pool, alice, "rh7").await.unwrap();
+        let a = bump_empty_listpays_sweeps(&pool, alice, "rh7")
+            .await
+            .unwrap();
+        let b = bump_empty_listpays_sweeps(&pool, alice, "rh7")
+            .await
+            .unwrap();
+        let c = bump_empty_listpays_sweeps(&pool, alice, "rh7")
+            .await
+            .unwrap();
         assert_eq!((a, b, c), (1, 2, 3));
 
         reset_empty_listpays_sweeps(&pool, alice, "rh7")
@@ -1814,7 +1665,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let n = bump_empty_listpays_sweeps(&pool, alice, "rh8").await.unwrap();
+        let n = bump_empty_listpays_sweeps(&pool, alice, "rh8")
+            .await
+            .unwrap();
         assert_eq!(n, 0, "settled row's sweep counter must stay at 0");
     }
 
@@ -1872,28 +1725,61 @@ pub(crate) mod tests {
         reserve_external_pay(&pool, alice, "ok_hash", "lnbc-ok", "memo", 10_000, 1_000)
             .await
             .unwrap();
-        settle_external_pay(&pool, alice, "ok_hash", "00000000000000000000000000000000000000000000000000000000aaaaaaaa", 500, 1_000)
-            .await
-            .unwrap();
+        settle_external_pay(
+            &pool,
+            alice,
+            "ok_hash",
+            "00000000000000000000000000000000000000000000000000000000aaaaaaaa",
+            500,
+            1_000,
+        )
+        .await
+        .unwrap();
 
         // Failed external — should NOT appear.
-        reserve_external_pay(&pool, alice, "fail_hash", "lnbc-fail", "memo", 20_000, 2_000)
-            .await
-            .unwrap();
+        reserve_external_pay(
+            &pool,
+            alice,
+            "fail_hash",
+            "lnbc-fail",
+            "memo",
+            20_000,
+            2_000,
+        )
+        .await
+        .unwrap();
         fail_external_pay(&pool, alice, "fail_hash", 20_000, 2_000)
             .await
             .unwrap();
 
         // Pending external — should NOT appear.
-        reserve_external_pay(&pool, alice, "pending_hash", "lnbc-pending", "memo", 30_000, 3_000)
-            .await
-            .unwrap();
+        reserve_external_pay(
+            &pool,
+            alice,
+            "pending_hash",
+            "lnbc-pending",
+            "memo",
+            30_000,
+            3_000,
+        )
+        .await
+        .unwrap();
 
-        // Internal — should appear. Use try_settle_internal to set up
-        // a hub-to-hub completed payment.
+        // Native self-payment — should appear as an internal completed payment.
         let bob = make_user(&pool, "bob").await;
         make_invoice(&pool, bob, "inv_internal", 5_000).await;
-        try_settle_internal(&pool, alice, "inv_internal", "lnbc-internal", 5_000, "memo")
+        reserve_external_pay(
+            &pool,
+            alice,
+            "inv_internal",
+            "lnbc-internal",
+            "memo",
+            5_000,
+            0,
+        )
+        .await
+        .unwrap();
+        settle_external_pay(&pool, alice, "inv_internal", "receipt", 0, 0)
             .await
             .unwrap();
 
@@ -2030,11 +1916,13 @@ pub(crate) mod tests {
         );
 
         // Backdate further: 32 days total. Refresh now also expired.
-        sqlx::query("UPDATE tokens SET created_at = created_at - (25*24*3600) WHERE refresh_token_hash = ?")
-            .bind(tokens::hash_token(&refresh))
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE tokens SET created_at = created_at - (25*24*3600) WHERE refresh_token_hash = ?",
+        )
+        .bind(tokens::hash_token(&refresh))
+        .execute(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             tokens::user_id_for_refresh(&pool, &refresh).await.unwrap(),
             None
@@ -2049,11 +1937,13 @@ pub(crate) mod tests {
         let (_, _) = tokens::create(&pool, alice).await.unwrap(); // fresh
 
         // Push old token's created_at past the 31-day refresh TTL.
-        sqlx::query("UPDATE tokens SET created_at = created_at - (32*24*3600) WHERE access_token_hash = ?")
-            .bind(tokens::hash_token(&access_old))
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE tokens SET created_at = created_at - (32*24*3600) WHERE access_token_hash = ?",
+        )
+        .bind(tokens::hash_token(&access_old))
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let removed = tokens::cleanup_expired(&pool).await.unwrap();
         assert_eq!(removed, 1);

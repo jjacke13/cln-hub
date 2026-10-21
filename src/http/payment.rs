@@ -1,9 +1,8 @@
 // src/http/payment.rs
 //
 // Payment-related authenticated endpoints:
-//   - POST /payinvoice   — pay a BOLT11. Internal short-circuit for
-//                          intra-hub destinations; external goes
-//                          through CLN `pay` with reserve/refund.
+//   - POST /payinvoice   — pay a BOLT11 via CLN with reserve/refund,
+//                          including native self-payments between hub users.
 //   - GET  /getbalance   — current balance, LndHub shape
 //   - GET  /gettxs       — outbound payment history + on-chain credits
 //   - GET  /getpending   — pending on-chain deposits (always `[]`,
@@ -45,16 +44,7 @@ pub(super) struct PayInvoiceReq {
 /// `POST /payinvoice` — debit the authenticated user and settle the
 /// destination invoice.
 ///
-/// **Slice 5a behaviour**: if the destination invoice is one we
-/// issued (i.e. another local user is the receiver), the whole
-/// thing happens inside one SQLite transaction — the sender is
-/// debited, the receiver is credited, and the invoice is marked
-/// settled. No fee. No CLN traffic.
-///
-/// If the destination invoice is **not** one of ours, we return a
-/// `402 Payment Required` with `code: 7` ("external payments require
-/// channels"). Slice 5b will replace that branch with a real
-/// `lightning-cli pay` flow.
+/// Local invoices use CLN self-payment so the invoice is also paid on the node.
 pub(super) async fn payinvoice(
     State(state): State<Arc<AppState>>,
     auth: AuthUser,
@@ -72,12 +62,7 @@ pub(super) async fn payinvoice(
     }
 
     // ---- 1. Decode the BOLT11 by asking CLN. ----
-    let decoded = cln::call(
-        &state.rpc_path,
-        "decode",
-        json!({"string": &req.invoice}),
-    )
-    .await?;
+    let decoded = cln::call(&state.rpc_path, "decode", json!({"string": &req.invoice})).await?;
 
     if decoded.get("valid").and_then(|v| v.as_bool()) == Some(false) {
         return Err(AppError::payment(7, "could not decode payment request"));
@@ -110,15 +95,19 @@ pub(super) async fn payinvoice(
     // amountless, and the handler trusts the user-supplied `amount`
     // field while CLN's `pay` is still called against the real
     // BOLT11 amount. That's an overpayment / hub-drain bug.
-    let invoice_msat = decoded.get("amount_msat").map(|value| {
-        cln::parse_msat(value).and_then(crate::amount::from_msat)
-            .ok_or_else(|| AppError::bad_request("invalid invoice amount"))
-    }).transpose()?;
+    let invoice_msat = decoded
+        .get("amount_msat")
+        .map(|value| {
+            cln::parse_msat(value)
+                .and_then(crate::amount::from_msat)
+                .ok_or_else(|| AppError::bad_request("invalid invoice amount"))
+        })
+        .transpose()?;
     let override_msat = parse_amount_sats_to_msat(&req.amount)?;
 
     let amount_msat = match (invoice_msat, override_msat) {
-        (Some(amt), _) => amt,                  // invoice has an amount; use it
-        (None, Some(amt)) => amt,               // amountless + override
+        (Some(amt), _) => amt,    // invoice has an amount; use it
+        (None, Some(amt)) => amt, // amountless + override
         (None, None) => {
             return Err(AppError::bad_request(
                 "amountless invoice requires an `amount` field (in sats)",
@@ -130,71 +119,28 @@ pub(super) async fn payinvoice(
         return Err(AppError::bad_request("invoice amount must be > 0"));
     }
 
-    // ---- 3. Try the internal short-circuit. ----
-    use db::InternalPayResult::*;
-    let result = db::try_settle_internal(
-        &state.db,
+    // CLN arbitrates local-vs-external payment races and supplies a real preimage.
+    let local = db::invoices::find_by_hash(&state.db, &payment_hash).await?;
+    if let Some(invoice) = &local {
+        if invoice.user_id == auth.user_id {
+            return Err(AppError::bad_request("cannot pay your own invoice"));
+        }
+        if invoice.settled_at.is_some() || invoice.expires_at <= db::unix_now() {
+            return Err(AppError::payment(7, "invoice already paid or expired"));
+        }
+    }
+    external_pay(
+        &state,
         auth.user_id,
         &payment_hash,
         &req.invoice,
-        amount_msat,
         &memo,
+        &destination,
+        amount_msat,
+        invoice_msat.is_none(),
+        local.is_some(),
     )
-    .await?;
-
-    match result {
-        Settled { receiver_user_id } => {
-            log::info!(
-                "internal payment: user {} -> user {}, {} msat, hash={}",
-                auth.user_id,
-                receiver_user_id,
-                amount_msat,
-                payment_hash,
-            );
-            // Internal payment — no real preimage from the network.
-            Ok(Json(payment_response(
-                &destination,
-                &payment_hash,
-                amount_msat,
-                0,
-                &memo,
-                None,
-            )))
-        }
-
-        AlreadyPaid => Err(AppError::payment(7, "invoice already paid")),
-
-        SelfPayment => Err(AppError::bad_request("cannot pay your own invoice")),
-
-        InsufficientBalance { balance_msat } => Err(AppError::payment(
-            5,
-            format!(
-                "not enough balance: have {} msat, need {} msat",
-                balance_msat, amount_msat
-            ),
-        )),
-
-        NotOurInvoice => {
-            // Slice 5b: external Lightning payment via CLN `pay`.
-            //
-            // `invoice_is_amountless` decides whether we explicitly
-            // pass `amount_msat` to CLN's `pay`. CLN refuses the
-            // arg when the BOLT11 already encodes an amount, and
-            // requires it when amountless — so the boolean carries
-            // exactly the right information across the boundary.
-            external_pay(
-                &state,
-                auth.user_id,
-                &payment_hash,
-                &req.invoice,
-                &memo,
-                &destination,
-                amount_msat,
-                invoice_msat.is_none(),
-            )
-            .await
-        }
-    }
+    .await
 }
 
 // =====================================================================
@@ -234,8 +180,13 @@ async fn external_pay(
     destination: &str,
     amount_msat: i64,
     invoice_is_amountless: bool,
+    internal: bool,
 ) -> Result<Json<Value>, AppError> {
-    let fee_reserve_msat = compute_fee_reserve_msat(amount_msat);
+    let fee_reserve_msat = if internal {
+        0
+    } else {
+        compute_fee_reserve_msat(amount_msat)
+    };
 
     // ---- 1. Reserve (atomic: balance check + pending row + ledger debit). ----
     use db::ReserveResult::*;
@@ -382,7 +333,9 @@ async fn external_pay(
             // Terminal failure. Refund the user.
             log::warn!(
                 "external pay failed (code {}): user={} hash={} — refunding",
-                code, user_id, payment_hash
+                code,
+                user_id,
+                payment_hash
             );
             let newly_failed = db::fail_external_pay(
                 &state.db,
@@ -410,7 +363,9 @@ async fn external_pay(
             // leave it pending. The reconciler retries.
             log::error!(
                 "external pay transport error: user={} hash={}: {:#} — leaving pending",
-                user_id, payment_hash, e
+                user_id,
+                payment_hash,
+                e
             );
             Err(AppError::payment(
                 6,
@@ -422,11 +377,7 @@ async fn external_pay(
 
 /// Build the LndHub-shaped /payinvoice success response.
 ///
-/// For internal payments there's no real Lightning preimage (the CLN
-/// invoice on this node is never actually settled by the network);
-/// we pass `None` and the response uses all-zero hex as a clearly-
-/// placeholder value. For external payments we pass `Some(<hex>)`
-/// from CLN's `pay` response.
+/// Native self-payments and external payments both return CLN's real preimage.
 fn payment_response(
     destination: &str,
     payment_hash: &str,
@@ -469,7 +420,9 @@ fn parse_amount_sats_to_msat(v: &Value) -> Result<Option<i64>, AppError> {
             .as_u64()
             .and_then(crate::amount::from_sats)
             .map(Some)
-            .ok_or_else(|| AppError::bad_request("amount must be a positive integer within monetary bounds")),
+            .ok_or_else(|| {
+                AppError::bad_request("amount must be a positive integer within monetary bounds")
+            }),
         Value::String(s) => {
             if s.is_empty() {
                 return Ok(None);
@@ -477,7 +430,8 @@ fn parse_amount_sats_to_msat(v: &Value) -> Result<Option<i64>, AppError> {
             let sats: u64 = s
                 .parse()
                 .map_err(|_| AppError::bad_request("amount must be a positive integer"))?;
-            crate::amount::from_sats(sats).map(Some)
+            crate::amount::from_sats(sats)
+                .map(Some)
                 .ok_or_else(|| AppError::bad_request("amount exceeds monetary bounds"))
         }
         _ => Err(AppError::bad_request(
@@ -492,12 +446,119 @@ mod amount_tests {
 
     #[test]
     fn rejects_amounts_that_previously_overflowed_the_reservation() {
-        for value in [json!(9_223_372_036_854_776_u64), json!(u64::MAX),
-            json!("9223372036854776"), json!(0), json!(-1)] {
+        for value in [
+            json!(9_223_372_036_854_776_u64),
+            json!(u64::MAX),
+            json!("9223372036854776"),
+            json!(0),
+            json!(-1),
+        ] {
             assert!(parse_amount_sats_to_msat(&value).is_err());
         }
-        assert!(matches!(parse_amount_sats_to_msat(&json!(1)), Ok(Some(1000))));
+        assert!(matches!(
+            parse_amount_sats_to_msat(&json!(1)),
+            Ok(Some(1000))
+        ));
         assert!(matches!(parse_amount_sats_to_msat(&Value::Null), Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn hub_transfer_uses_native_self_payment_and_real_receipt() {
+        let pool = db::tests::fresh_pool().await;
+        let payer = db::tests::make_user(&pool, "payer").await;
+        let receiver = db::tests::make_user(&pool, "receiver").await;
+        db::tests::seed_balance(&pool, payer, 30_000).await;
+        db::tests::make_invoice(&pool, receiver, "local", 30_000).await;
+        let preimage = "ab".repeat(32);
+        let (path, server) = crate::test_support::rpc(vec![
+            (
+                "decode",
+                json!({"string": "lnbc-test"}),
+                json!({"valid": true, "payment_hash": "local", "amount_msat": 30_000}),
+            ),
+            (
+                "pay",
+                json!({"bolt11": "lnbc-test", "maxfee": 0}),
+                json!({"payment_preimage": preimage, "amount_sent_msat": 30_000}),
+            ),
+        ])
+        .await;
+        let state = Arc::new(AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        });
+        let result = payinvoice(
+            State(state),
+            AuthUser { user_id: payer },
+            Json(PayInvoiceReq {
+                invoice: "lnbc-test".into(),
+                amount: Value::Null,
+            }),
+        )
+        .await;
+        let response = match result {
+            Ok(Json(value)) => value,
+            Err(_) => panic!("self-payment failed"),
+        };
+        server.await.unwrap();
+        assert_eq!(response["payment_preimage"], preimage);
+        assert_eq!(response["payment_route"]["total_fees_msat"], 0);
+        // CLN's notification and periodic recovery both use this idempotent receipt path.
+        assert!(db::settle_invoice(&pool, "local", 30_000).await.unwrap());
+        assert!(!db::settle_invoice(&pool, "local", 30_000).await.unwrap());
+        assert_eq!(db::balance_msat(&pool, payer).await.unwrap(), 0);
+        assert_eq!(db::balance_msat(&pool, receiver).await.unwrap(), 30_000);
+        assert_eq!(
+            db::payments::list_for_user(&pool, payer).await.unwrap()[0].status,
+            "internal"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_local_payment_never_calls_pay() {
+        for case in ["self", "expired", "paid", "insufficient"] {
+            let pool = db::tests::fresh_pool().await;
+            let payer = db::tests::make_user(&pool, "payer").await;
+            let receiver = if case == "self" {
+                payer
+            } else {
+                db::tests::make_user(&pool, "receiver").await
+            };
+            db::tests::make_invoice(&pool, receiver, "local", 30_000).await;
+            if case == "expired" {
+                sqlx::query("UPDATE invoices SET expires_at=1")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            if case == "paid" {
+                db::settle_invoice(&pool, "local", 30_000).await.unwrap();
+            }
+            let (path, server) = crate::test_support::rpc(vec![(
+                "decode",
+                json!({"string": "lnbc-test"}),
+                json!({"valid": true, "payment_hash": "local", "amount_msat": 30_000}),
+            )])
+            .await;
+            let state = Arc::new(AppState {
+                rpc_path: path,
+                db: pool.clone(),
+                min_deposit_confs: 6,
+            });
+            assert!(payinvoice(
+                State(state),
+                AuthUser { user_id: payer },
+                Json(PayInvoiceReq {
+                    invoice: "lnbc-test".into(),
+                    amount: Value::Null
+                })
+            )
+            .await
+            .is_err());
+            server.await.unwrap();
+            assert!(db::list_pending_external(&pool).await.unwrap().is_empty());
+        }
     }
 }
 
@@ -638,8 +699,7 @@ pub(super) async fn gettxs(
 
     // Each entry carries its own timestamp; collect (ts, json) so we
     // can sort the merged list without re-extracting after the fact.
-    let mut entries: Vec<(i64, Value)> =
-        Vec::with_capacity(payments.len() + onchain.len());
+    let mut entries: Vec<(i64, Value)> = Vec::with_capacity(payments.len() + onchain.len());
 
     for r in payments {
         entries.push((
