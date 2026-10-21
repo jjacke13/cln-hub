@@ -76,8 +76,7 @@ pub async fn invoice_payment(plugin: Plugin<Arc<AppState>>, request: Value) -> R
 
     let msat = crate::amount::from_msat(msat)
         .ok_or_else(|| anyhow!("invoice_payment amount exceeds monetary bounds"))?;
-    let credited =
-        db::settle_invoice(&state.db, &invoice.payment_hash, msat).await?;
+    let credited = db::settle_invoice(&state.db, &invoice.payment_hash, msat).await?;
 
     if credited {
         log::info!(
@@ -237,22 +236,34 @@ async fn reconcile_once(state: &AppState) -> Result<()> {
 async fn reconcile_incoming_once(state: &AppState) -> Result<()> {
     for invoice in db::invoices::list_unsettled(&state.db).await? {
         if let Err(error) = reconcile_incoming_invoice(state, &invoice).await {
-            log::warn!("incoming reconciliation failed for {}: {:#}", invoice.payment_hash, error);
+            log::warn!(
+                "incoming reconciliation failed for {}: {:#}",
+                invoice.payment_hash,
+                error
+            );
         }
     }
     Ok(())
 }
 
 async fn reconcile_incoming_invoice(state: &AppState, invoice: &db::invoices::Row) -> Result<()> {
-    let response = cln::call(&state.rpc_path, "listinvoices", json!({"label": invoice.label})).await?;
-    let invoices = response["invoices"].as_array()
+    let response = cln::call(
+        &state.rpc_path,
+        "listinvoices",
+        json!({"label": invoice.label}),
+    )
+    .await?;
+    let invoices = response["invoices"]
+        .as_array()
         .ok_or_else(|| anyhow!("listinvoices response missing invoices array"))?;
     for paid in invoices {
         if paid["status"].as_str() != Some("paid") {
             continue;
         }
-        anyhow::ensure!(paid["payment_hash"].as_str() == Some(&invoice.payment_hash),
-            "listinvoices returned a different payment hash");
+        anyhow::ensure!(
+            paid["payment_hash"].as_str() == Some(&invoice.payment_hash),
+            "listinvoices returned a different payment hash"
+        );
         let received = cln::parse_msat(&paid["amount_received_msat"])
             .and_then(crate::amount::from_msat)
             .ok_or_else(|| anyhow!("paid invoice has invalid amount_received_msat"))?;
@@ -266,6 +277,98 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn malformed_listpays_never_refunds_or_counts_as_empty() {
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "payer").await;
+        db::tests::seed_balance(&pool, user, 100_000).await;
+        db::reserve_external_pay(&pool, user, "hash", "lnbc", "", 30_000, 5000)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE payments SET created_at=?, empty_listpays_sweeps=2")
+            .bind(db::unix_now() - 600)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pending = db::list_pending_external(&pool)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let responses = [
+            json!({}),
+            json!({"pays": null}),
+            json!({"pays": {}}),
+            json!({"pays": [{"payment_hash": "other", "status": "failed"}]}),
+            json!({"pays": [{"payment_hash": "hash"}]}),
+        ];
+        let steps = responses
+            .into_iter()
+            .map(|response| ("listpays", json!({"payment_hash": "hash"}), response))
+            .collect();
+        let (path, server) = crate::test_support::rpc(steps).await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        };
+        for _ in 0..5 {
+            assert!(reconcile_one(&state, &pending).await.is_err());
+        }
+        server.await.unwrap();
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 65_000);
+        assert_eq!(db::list_pending_external(&pool).await.unwrap().len(), 1);
+        let (sweeps,): (i64,) = sqlx::query_as("SELECT empty_listpays_sweeps FROM payments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sweeps, 0);
+    }
+
+    #[tokio::test]
+    async fn valid_empty_listpays_still_requires_three_old_sweeps() {
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "payer").await;
+        db::tests::seed_balance(&pool, user, 100_000).await;
+        db::reserve_external_pay(&pool, user, "hash", "lnbc", "", 30_000, 5000)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE payments SET created_at=?")
+            .bind(db::unix_now() - 600)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pending = db::list_pending_external(&pool)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let (path, server) = crate::test_support::rpc(
+            (0..3)
+                .map(|_| {
+                    (
+                        "listpays",
+                        json!({"payment_hash": "hash"}),
+                        json!({"pays": []}),
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        };
+        for _ in 0..2 {
+            reconcile_one(&state, &pending).await.unwrap();
+            assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 65_000);
+        }
+        reconcile_one(&state, &pending).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 100_000);
+    }
+
+    #[tokio::test]
     async fn missed_invoice_notification_is_recovered_exactly_once() {
         let pool = db::tests::fresh_pool().await;
         let user = db::tests::make_user(&pool, "receiver").await;
@@ -273,11 +376,17 @@ mod tests {
         assert!(!db::settle_invoice(&pool, "incoming", 30_000).await.unwrap());
         db::tests::make_invoice(&pool, user, "incoming", 30_000).await;
         let (path, server) = crate::test_support::rpc(vec![(
-            "listinvoices", json!({"label": "test-incoming"}),
+            "listinvoices",
+            json!({"label": "test-incoming"}),
             json!({"invoices": [{"payment_hash": "incoming", "status": "paid",
                 "amount_received_msat": "31000msat"}]}),
-        )]).await;
-        let state = AppState { rpc_path: path, db: pool.clone(), min_deposit_confs: 6 };
+        )])
+        .await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        };
         reconcile_incoming_once(&state).await.unwrap();
         server.await.unwrap();
         reconcile_incoming_once(&state).await.unwrap();
@@ -291,10 +400,16 @@ mod tests {
         let user = db::tests::make_user(&pool, "receiver").await;
         db::tests::make_invoice(&pool, user, "incoming", 30_000).await;
         let (path, server) = crate::test_support::rpc(vec![(
-            "listinvoices", json!({"label": "test-incoming"}),
+            "listinvoices",
+            json!({"label": "test-incoming"}),
             json!({"invoices": [{"payment_hash": "incoming", "status": "paid"}]}),
-        )]).await;
-        let state = AppState { rpc_path: path, db: pool.clone(), min_deposit_confs: 6 };
+        )])
+        .await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        };
         reconcile_incoming_once(&state).await.unwrap();
         server.await.unwrap();
         assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 0);
@@ -313,11 +428,20 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
     )
     .await?;
 
-    let pays = resp
-        .get("pays")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let Some(pays) = resp.get("pays").and_then(Value::as_array) else {
+        db::reset_empty_listpays_sweeps(&state.db, p.user_id, &p.payment_hash).await?;
+        anyhow::bail!("listpays response missing pays array; leaving payment pending");
+    };
+    if pays.iter().any(|pay| {
+        pay["payment_hash"].as_str() != Some(p.payment_hash.as_str())
+            || !matches!(
+                pay["status"].as_str(),
+                Some("complete" | "failed" | "pending")
+            )
+    }) {
+        db::reset_empty_listpays_sweeps(&state.db, p.user_id, &p.payment_hash).await?;
+        anyhow::bail!("listpays returned an invalid payment record; leaving payment pending");
+    }
 
     // ---- Empty listpays: handle very conservatively. ----
     //
@@ -349,8 +473,7 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
             return Ok(());
         }
 
-        let sweeps =
-            db::bump_empty_listpays_sweeps(&state.db, p.user_id, &p.payment_hash).await?;
+        let sweeps = db::bump_empty_listpays_sweeps(&state.db, p.user_id, &p.payment_hash).await?;
 
         if sweeps < MIN_EMPTY_SWEEPS_BEFORE_REFUND {
             log::info!(
@@ -417,7 +540,8 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
                 log::warn!(
                     "reconcile: hash={} listpays.complete missing/invalid preimage; \
                      leaving pending for retry. raw last={:?}",
-                    p.payment_hash, last
+                    p.payment_hash,
+                    last
                 );
                 return Ok(());
             };
@@ -565,15 +689,24 @@ async fn scan_once(state: &AppState) -> Result<()> {
             .to_string();
         let vout = output.get("output").and_then(|v| v.as_i64()).unwrap_or(0);
         let amount_msat = cln::parse_msat(output.get("amount_msat").unwrap_or(&Value::Null))
-            .and_then(crate::amount::from_msat).unwrap_or(0);
+            .and_then(crate::amount::from_msat)
+            .unwrap_or(0);
         let blockheight = output.get("blockheight").and_then(|v| v.as_i64());
 
         if amount_msat <= 0 || txid.is_empty() {
             continue;
         }
 
-        match db::credit_onchain(&state.db, &txid, vout, user_id, address, amount_msat, blockheight)
-            .await
+        match db::credit_onchain(
+            &state.db,
+            &txid,
+            vout,
+            user_id,
+            address,
+            amount_msat,
+            blockheight,
+        )
+        .await
         {
             Ok(true) => log::info!(
                 "on-chain credit: user={} {}msat at {}:{} (block {:?})",
