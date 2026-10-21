@@ -12,6 +12,7 @@
 // hooks (e.g. `htlc_accepted` if we want to mediate payments) and
 // notifications.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -101,7 +102,7 @@ pub async fn invoice_payment(plugin: Plugin<Arc<AppState>>, request: Value) -> R
 // =====================================================================
 
 /// Background polling loop. Every `POLL_INTERVAL`, asks CLN for the
-/// list of on-chain UTXOs (`listfunds`); for any confirmed output to
+/// list of on-chain outputs (`listfunds spent=true`); for any sufficiently confirmed output to
 /// an address in our `addresses` table that we haven't already
 /// credited, atomically:
 ///   - inserts a row into `onchain_credits` (idempotency key)
@@ -275,6 +276,137 @@ async fn reconcile_incoming_invoice(state: &AppState, invoice: &db::invoices::Ro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn spent_deposit_recovery_uses_original_height_and_is_idempotent() {
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "receiver").await;
+        db::addresses::create(&pool, user, "regtest-deposit")
+            .await
+            .unwrap();
+        let spent_hash = "de".repeat(32);
+        let confirmed_hash = "cf".repeat(32);
+        let outputs = json!({"outputs": [
+            {"txid": spent_hash, "output": 0, "address": "regtest-deposit",
+             "amount_msat": 30_000, "status": "spent"},
+            {"txid": confirmed_hash, "output": 1, "address": "regtest-deposit",
+             "amount_msat": 20_000, "status": "confirmed", "blockheight": 100}
+        ]});
+        let mut steps = Vec::new();
+        for _ in 0..2 {
+            steps.extend([
+                ("getinfo", json!({}), json!({"blockheight": 110})),
+                ("listfunds", json!({"spent": true}), outputs.clone()),
+                (
+                    "listtransactions",
+                    json!({}),
+                    json!({"transactions": [
+                        {"hash": spent_hash, "blockheight": 100}
+                    ]}),
+                ),
+            ]);
+        }
+        let (path, server) = crate::test_support::rpc(steps).await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        };
+        scan_once(&state).await.unwrap();
+        scan_once(&state).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 50_000);
+        let deposits = db::onchain_credits::list_for_user(&pool, user)
+            .await
+            .unwrap();
+        assert_eq!(deposits.len(), 2);
+        assert!(deposits
+            .iter()
+            .all(|deposit| deposit.blockheight == Some(100)));
+    }
+
+    #[tokio::test]
+    async fn spent_output_still_requires_a_known_sufficiently_confirmed_deposit() {
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "receiver").await;
+        db::addresses::create(&pool, user, "regtest-deposit")
+            .await
+            .unwrap();
+        let output = json!({"txid": "unknown", "output": 0, "address": "regtest-deposit",
+            "amount_msat": 30_000, "status": "spent"});
+        let mut outputs = Vec::new();
+        for (hash, height) in [
+            ("unknown", None),
+            ("unconfirmed", Some(0)),
+            ("shallow", Some(108)),
+            ("future", Some(111)),
+            ("negative", Some(-1)),
+        ] {
+            let mut entry = output.clone();
+            entry["txid"] = json!(hash);
+            if let Some(height) = height {
+                entry["blockheight"] = json!(height);
+            }
+            outputs.push(entry);
+        }
+        let mut no_index = output.clone();
+        no_index.as_object_mut().unwrap().remove("output");
+        no_index["blockheight"] = json!(100);
+        outputs.push(no_index);
+        let (path, server) = crate::test_support::rpc(vec![
+            ("getinfo", json!({}), json!({"blockheight": 110})),
+            (
+                "listfunds",
+                json!({"spent": true}),
+                json!({"outputs": outputs}),
+            ),
+            (
+                "listtransactions",
+                json!({}),
+                json!({"transactions": [
+                    {"hash": "unconfirmed", "blockheight": 0},
+                    {"hash": "unrelated-spend", "blockheight": 100}
+                ]}),
+            ),
+        ])
+        .await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        };
+        scan_once(&state).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 0);
+        assert!(db::onchain_credits::list_for_user(&pool, user)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_transaction_history_cannot_supply_deposit_confirmations() {
+        let pool = db::tests::fresh_pool().await;
+        let (path, server) = crate::test_support::rpc(vec![
+            ("getinfo", json!({}), json!({"blockheight": 110})),
+            (
+                "listfunds",
+                json!({"spent": true}),
+                json!({"outputs": [
+                    {"txid": "unknown", "status": "spent"}
+                ]}),
+            ),
+            ("listtransactions", json!({}), json!({"transactions": null})),
+        ])
+        .await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool,
+            min_deposit_confs: 6,
+        };
+        assert!(scan_once(&state).await.is_err());
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn reconciler_matches_the_current_attempt_label() {
@@ -675,38 +807,72 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
 ///
 /// === Why we re-query the chain tip every pass ===
 ///
-/// CLN's `listfunds` reports each UTXO's `blockheight` (where it
-/// landed) but NOT its current depth. To enforce
-/// `min_deposit_confs` we compare against the current tip from
-/// `getinfo`. One extra unix-socket round trip per scan;
-/// imperceptible cost.
+/// Confirmation depth comes from the current tip and the deposit's height,
+/// never its spending transaction. Spent outputs may omit their height;
+/// recover that from CLN's transaction history before crediting anything.
 async fn scan_once(state: &AppState) -> Result<()> {
     let info = cln::call(&state.rpc_path, "getinfo", json!({})).await?;
     let tip = info
         .get("blockheight")
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .filter(|height| *height > 0)
+        .ok_or_else(|| anyhow!("getinfo returned no valid chain height"))?;
 
-    let resp = cln::call(&state.rpc_path, "listfunds", json!({})).await?;
+    let resp = cln::call(&state.rpc_path, "listfunds", json!({"spent": true})).await?;
 
-    let Some(outputs) = resp.get("outputs").and_then(|v| v.as_array()) else {
-        return Ok(());
+    let outputs = resp
+        .get("outputs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("listfunds response missing outputs array"))?;
+    let historical_heights: HashMap<String, i64> = if outputs.iter().any(|output| {
+        output["status"].as_str() == Some("spent")
+            && output["blockheight"]
+                .as_i64()
+                .filter(|height| *height > 0)
+                .is_none()
+    }) {
+        let history = cln::call(&state.rpc_path, "listtransactions", json!({})).await?;
+        let transactions = history["transactions"]
+            .as_array()
+            .ok_or_else(|| anyhow!("listtransactions response missing transactions array"))?;
+        transactions
+            .iter()
+            .filter_map(|tx| {
+                let hash = tx["hash"].as_str()?;
+                let height = tx["blockheight"].as_i64().filter(|height| *height > 0)?;
+                Some((hash.to_owned(), height))
+            })
+            .collect()
+    } else {
+        HashMap::new()
     };
 
     for output in outputs {
-        // Only confirmed deposits get credited. CLN reports
-        // unconfirmed outputs too, but we'd rather wait — a
-        // reorg-and-double-spend would otherwise leave us with a
-        // ledger credit but no real coins.
+        // Spending a deposit does not erase its owner's right to the credit.
         let status = output.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if status != "confirmed" {
+        if !matches!(status, "confirmed" | "spent") {
             continue;
         }
 
+        let Some(txid) = output["txid"].as_str().filter(|hash| !hash.is_empty()) else {
+            continue;
+        };
+        let Some(vout) = output["output"]
+            .as_u64()
+            .and_then(|vout| u32::try_from(vout).ok())
+        else {
+            continue;
+        };
         // Depth = tip - blockheight + 1 (inclusive).
         // Skip until we have at least `min_deposit_confs`.
-        let blockheight = output.get("blockheight").and_then(|v| v.as_i64());
-        let depth = blockheight.map(|bh| tip - bh + 1).unwrap_or(0);
+        let blockheight = output["blockheight"]
+            .as_i64()
+            .filter(|height| *height > 0)
+            .or_else(|| historical_heights.get(txid).copied());
+        let Some(height) = blockheight.filter(|height| *height <= tip) else {
+            continue;
+        };
+        let depth = tip - height + 1;
         if depth < state.min_deposit_confs {
             log::debug!(
                 "deposit watcher: skipping txid={:?} (depth {} < min {})",
@@ -733,25 +899,18 @@ async fn scan_once(state: &AppState) -> Result<()> {
             continue; // not ours
         };
 
-        let txid = output
-            .get("txid")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let vout = output.get("output").and_then(|v| v.as_i64()).unwrap_or(0);
         let amount_msat = cln::parse_msat(output.get("amount_msat").unwrap_or(&Value::Null))
             .and_then(crate::amount::from_msat)
             .unwrap_or(0);
-        let blockheight = output.get("blockheight").and_then(|v| v.as_i64());
 
-        if amount_msat <= 0 || txid.is_empty() {
+        if amount_msat <= 0 {
             continue;
         }
 
         match db::credit_onchain(
             &state.db,
-            &txid,
-            vout,
+            txid,
+            i64::from(vout),
             user_id,
             address,
             amount_msat,

@@ -279,6 +279,8 @@ List the calling user's outbound Lightning payments and confirmed on-chain depos
 
 `amount` is a BTC-denominated float (LndHub canon); `amount_msat` is the same value in millisatoshis. `confirmations` is always `null` (we don't recompute live depth; the credit only lands after the configured `cln-hub-min-deposit-confs` threshold has been crossed).
 
+The deposit watcher also recovers outputs spent while the hub was stopped. It checks the original deposit's confirmation height, using CLN's transaction history when necessary. Unknown or insufficient confirmations leave the output uncredited for a later pass; a recovered output is credited only once.
+
 Only **completed** payments appear here. Failed and in-flight Lightning payments are not exposed via `/gettxs`.
 
 ### `GET /getpending`

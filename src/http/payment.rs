@@ -584,10 +584,7 @@ pub(super) async fn getbalance(
 
 /// `GET /getpending` — list pending on-chain deposits.
 ///
-/// We don't yet credit on-chain deposits (the polling task that
-/// would watch CLN's `listfunds` and call `db::ledger::credit` is
-/// a future slice). Returning `[]` keeps stricter LndHub clients
-/// happy at session start without misrepresenting state.
+/// Deposits appear in the balance/history only after the confirmation threshold.
 pub(super) async fn getpending(_auth: AuthUser) -> Json<Value> {
     Json(Value::Array(vec![]))
 }
@@ -607,11 +604,8 @@ pub(super) async fn getpending(_auth: AuthUser) -> Json<Value> {
 /// Response shape (matching original LndHub):
 ///     [{"address": "bc1q..."}]
 ///
-/// **Known limitation as of slice 5d**: deposits TO this address land
-/// in CLN's on-chain wallet but are NOT yet credited to the user's
-/// internal balance. A future slice will add a polling task that
-/// watches `lightning-cli listfunds` for new confirmed outputs to
-/// our addresses and writes corresponding `ledger` rows.
+/// The deposit watcher credits confirmed receipts, including outputs spent
+/// while the hub was stopped. Replaying history cannot credit an output twice.
 pub(super) async fn getbtc(
     State(state): State<Arc<AppState>>,
     auth: AuthUser,
@@ -652,7 +646,7 @@ pub(super) async fn getbtc(
     }
 
     log::info!(
-        "minted deposit address for user {}: {} (note: deposits not yet auto-credited)",
+        "minted deposit address for user {}: {}",
         auth.user_id,
         address
     );
