@@ -21,6 +21,7 @@
 //   6. `.join()` blocks until lightningd closes our stdin
 //      (shutdown / unload).
 
+mod amount;
 mod cln;
 mod db;
 mod http;

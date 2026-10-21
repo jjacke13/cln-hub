@@ -755,6 +755,7 @@ pub async fn try_settle_internal(
     amount_msat: i64,
     memo: &str,
 ) -> Result<InternalPayResult> {
+    crate::amount::reserve_total(amount_msat, 0)?;
     let mut tx = pool.begin().await?;
 
     // (1) Find the invoice.
@@ -918,9 +919,9 @@ pub async fn reserve_external_pay(
     amount_msat: i64,
     fee_reserve_msat: i64,
 ) -> Result<ReserveResult> {
+    let total = crate::amount::reserve_total(amount_msat, fee_reserve_msat)?;
     let mut tx = pool.begin().await?;
     let now = unix_now();
-    let total = amount_msat + fee_reserve_msat;
 
     // (1) Balance check INSIDE the tx — without this, two concurrent
     //     reserves could each pass and we'd overdraft.
@@ -1017,6 +1018,8 @@ pub async fn settle_external_pay(
     actual_fee_msat: i64,
     fee_reserve_msat: i64,
 ) -> Result<bool> {
+    anyhow::ensure!(actual_fee_msat >= 0 && actual_fee_msat <= fee_reserve_msat,
+        "actual fee exceeds reserved fee");
     let mut tx = pool.begin().await?;
     let now = unix_now();
 
@@ -1081,9 +1084,9 @@ pub async fn fail_external_pay(
     amount_msat: i64,
     fee_reserve_msat: i64,
 ) -> Result<bool> {
+    let total = crate::amount::reserve_total(amount_msat, fee_reserve_msat)?;
     let mut tx = pool.begin().await?;
     let now = unix_now();
-    let total = amount_msat + fee_reserve_msat;
 
     let updated = sqlx::query(
         "UPDATE payments \
@@ -1237,6 +1240,7 @@ pub async fn credit_onchain(
     amount_msat: i64,
     blockheight: Option<i64>,
 ) -> Result<bool> {
+    crate::amount::reserve_total(amount_msat, 0)?;
     let mut tx = pool.begin().await?;
     let now = unix_now();
 
@@ -1308,6 +1312,7 @@ pub async fn settle_invoice(
     payment_hash: &str,
     settled_msat: i64,
 ) -> Result<bool> {
+    crate::amount::reserve_total(settled_msat, 0)?;
     let mut tx = pool.begin().await?;
     let now = unix_now();
 
@@ -1465,6 +1470,18 @@ mod tests {
     }
 
     // ---------- users ----------
+
+    #[tokio::test]
+    async fn impossible_reserve_cannot_credit_an_empty_account() {
+        let pool = fresh_pool().await;
+        let user = make_user(&pool, "overflow").await;
+        for (amount, fee) in [(i64::MAX, i64::MAX / 100), (1, -1), (0, 5000)] {
+            assert!(reserve_external_pay(&pool, user, "overflow", "lnbc", "", amount, fee)
+                .await.is_err());
+        }
+        assert_eq!(balance_msat(&pool, user).await.unwrap(), 0);
+        assert!(list_pending_external(&pool).await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn users_create_and_verify_round_trip() {

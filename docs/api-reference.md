@@ -125,7 +125,7 @@ Issue a BOLT11 invoice owned by the calling user. When this invoice is paid (by 
 { "amt": 5000, "memo": "coffee" }
 ```
 
-`amt` is in **satoshis**, may be a number or a string of digits.
+`amt` is in **satoshis**, may be a number or a string of digits. Amounts must be positive and at most 21 million BTC; out-of-range values are rejected rather than rounded or saturated. A payment plus its fee reserve must also fit this bound.
 
 **Response 200:**
 

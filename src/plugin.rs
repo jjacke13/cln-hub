@@ -74,11 +74,10 @@ pub async fn invoice_payment(plugin: Plugin<Arc<AppState>>, request: Value) -> R
         }
     };
 
-    // `as i64` because SQLite's INTEGER is signed 64-bit. msat fits
-    // comfortably (max payable Lightning amount is ~21M BTC ≈ 2.1e15
-    // msat, well below i64::MAX).
+    let msat = crate::amount::from_msat(msat)
+        .ok_or_else(|| anyhow!("invoice_payment amount exceeds monetary bounds"))?;
     let credited =
-        db::settle_invoice(&state.db, &invoice.payment_hash, msat as i64).await?;
+        db::settle_invoice(&state.db, &invoice.payment_hash, msat).await?;
 
     if credited {
         log::info!(
@@ -349,10 +348,7 @@ async fn reconcile_one(state: &AppState, p: &db::PendingPayment) -> Result<()> {
                 );
                 return Ok(());
             };
-            let sent_msat = cln::parse_msat(&last["amount_sent_msat"])
-                .map(|n| n as i64)
-                .unwrap_or(p.amount_msat);
-            let actual_fee_msat = (sent_msat - p.amount_msat).max(0);
+            let actual_fee_msat = cln::payment_fee_msat(last, p.amount_msat, p.fee_reserve_msat)?;
 
             let settled = db::settle_external_pay(
                 &state.db,
@@ -496,7 +492,7 @@ async fn scan_once(state: &AppState) -> Result<()> {
             .to_string();
         let vout = output.get("output").and_then(|v| v.as_i64()).unwrap_or(0);
         let amount_msat = cln::parse_msat(output.get("amount_msat").unwrap_or(&Value::Null))
-            .unwrap_or(0) as i64;
+            .and_then(crate::amount::from_msat).unwrap_or(0);
         let blockheight = output.get("blockheight").and_then(|v| v.as_i64());
 
         if amount_msat <= 0 || txid.is_empty() {

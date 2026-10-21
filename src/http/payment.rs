@@ -110,10 +110,10 @@ pub(super) async fn payinvoice(
     // amountless, and the handler trusts the user-supplied `amount`
     // field while CLN's `pay` is still called against the real
     // BOLT11 amount. That's an overpayment / hub-drain bug.
-    let invoice_msat = decoded
-        .get("amount_msat")
-        .and_then(cln::parse_msat)
-        .map(|n| n as i64);
+    let invoice_msat = decoded.get("amount_msat").map(|value| {
+        cln::parse_msat(value).and_then(crate::amount::from_msat)
+            .ok_or_else(|| AppError::bad_request("invalid invoice amount"))
+    }).transpose()?;
     let override_msat = parse_amount_sats_to_msat(&req.amount)?;
 
     let amount_msat = match (invoice_msat, override_msat) {
@@ -318,10 +318,7 @@ async fn external_pay(
                     resp
                 ))
             })?;
-            let sent_msat = cln::parse_msat(&resp["amount_sent_msat"])
-                .map(|n| n as i64)
-                .unwrap_or(amount_msat);
-            let actual_fee_msat = (sent_msat - amount_msat).max(0);
+            let actual_fee_msat = cln::payment_fee_msat(&resp, amount_msat, fee_reserve_msat)?;
 
             // `settle_external_pay` returns Ok(false) when the row has
             // already been finalized by the reconciler racing us — the
@@ -470,8 +467,9 @@ fn parse_amount_sats_to_msat(v: &Value) -> Result<Option<i64>, AppError> {
         Value::Null => Ok(None),
         Value::Number(n) => n
             .as_u64()
-            .map(|sats| Some((sats as i64).saturating_mul(1000)))
-            .ok_or_else(|| AppError::bad_request("amount must be a positive integer")),
+            .and_then(crate::amount::from_sats)
+            .map(Some)
+            .ok_or_else(|| AppError::bad_request("amount must be a positive integer within monetary bounds")),
         Value::String(s) => {
             if s.is_empty() {
                 return Ok(None);
@@ -479,11 +477,27 @@ fn parse_amount_sats_to_msat(v: &Value) -> Result<Option<i64>, AppError> {
             let sats: u64 = s
                 .parse()
                 .map_err(|_| AppError::bad_request("amount must be a positive integer"))?;
-            Ok(Some((sats as i64).saturating_mul(1000)))
+            crate::amount::from_sats(sats).map(Some)
+                .ok_or_else(|| AppError::bad_request("amount exceeds monetary bounds"))
         }
         _ => Err(AppError::bad_request(
             "amount must be a number or string of digits",
         )),
+    }
+}
+
+#[cfg(test)]
+mod amount_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_amounts_that_previously_overflowed_the_reservation() {
+        for value in [json!(9_223_372_036_854_776_u64), json!(u64::MAX),
+            json!("9223372036854776"), json!(0), json!(-1)] {
+            assert!(parse_amount_sats_to_msat(&value).is_err());
+        }
+        assert!(matches!(parse_amount_sats_to_msat(&json!(1)), Ok(Some(1000))));
+        assert!(matches!(parse_amount_sats_to_msat(&Value::Null), Ok(None)));
     }
 }
 

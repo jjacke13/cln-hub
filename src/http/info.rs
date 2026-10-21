@@ -71,7 +71,8 @@ pub(super) async fn decodeinvoice(
     // bare `as_i64` would silently report amountless on the string
     // form.
     if let Some(amount_msat) = resp.get("amount_msat").and_then(cln::parse_msat) {
-        let amount_msat = amount_msat as i64;
+        let amount_msat = crate::amount::from_msat(amount_msat)
+            .ok_or_else(|| AppError::bad_request("invalid invoice amount"))?;
         out["num_satoshis"] = json!((amount_msat / 1000).to_string());
         out["num_msat"] = json!(amount_msat.to_string());
     }

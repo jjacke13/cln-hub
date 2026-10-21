@@ -60,7 +60,8 @@ pub(super) async fn addinvoice(
     if amt == 0 {
         return Err(AppError::bad_request("amt must be > 0"));
     }
-    let amount_msat: i64 = (amt as i64).saturating_mul(1000);
+    let amount_msat = crate::amount::from_sats(amt)
+        .ok_or_else(|| AppError::bad_request("amt exceeds monetary bounds"))?;
 
     // Generate a unique label so the invoice_payment notification
     // can route the settle event back to this user.

@@ -175,6 +175,16 @@ pub async fn call(socket: &Path, method: &str, params: Value) -> Result<Value> {
     call_strict(socket, method, params).await.map_err(Into::into)
 }
 
+/// Validate a successful payment's amount before calculating its fee.
+pub fn payment_fee_msat(response: &Value, amount: i64, reserve: i64) -> Result<i64> {
+    let sent = parse_msat(&response["amount_sent_msat"])
+        .and_then(crate::amount::from_msat)
+        .ok_or_else(|| anyhow!("missing or invalid amount_sent_msat"))?;
+    let fee = sent.checked_sub(amount).filter(|n| *n >= 0 && *n <= reserve)
+        .ok_or_else(|| anyhow!("CLN payment amount or fee disagrees with reservation"))?;
+    Ok(fee)
+}
+
 /// Parse a CLN `msat` field as it appears on the wire.
 ///
 /// CLN's wire format for millisatoshi values has shifted between
@@ -219,6 +229,15 @@ pub fn validate_preimage(v: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fee_requires_a_bounded_consistent_sent_amount() {
+        assert_eq!(payment_fee_msat(&json!({"amount_sent_msat": 1100}), 1000, 500).unwrap(), 100);
+        for response in [json!({}), json!({"amount_sent_msat": u64::MAX}),
+            json!({"amount_sent_msat": 999}), json!({"amount_sent_msat": 1600})] {
+            assert!(payment_fee_msat(&response, 1000, 500).is_err());
+        }
+    }
     use serde_json::json;
 
     #[test]
