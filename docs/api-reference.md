@@ -161,6 +161,8 @@ List the calling user's invoices, newest first.
 
 `ispaid` flips to `true` once the invoice settles. `settled_amt_msat` is `null` until then; afterwards it holds the actual paid amount in millisatoshis. `expire_time` is the remaining validity window in seconds at issue time (CLN-supplied `expires_at` minus our creation timestamp). `timestamp` is unix epoch seconds.
 
+Incoming credits are recovered from CLN's paid-invoice records on startup and every 60 seconds, so a missed live notification does not permanently lose the credit. Keep the CLN invoice records until the hub has recorded payment.
+
 ### `POST /payinvoice`
 
 Pay a BOLT11 invoice from the calling user's balance.

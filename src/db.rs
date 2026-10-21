@@ -501,6 +501,13 @@ pub mod invoices {
         let rows: Vec<RowTuple> = sqlx::query_as(&q).bind(user_id).fetch_all(pool).await?;
         Ok(rows.into_iter().map(from_tuple).collect())
     }
+
+    /// Notifications can be missed during downtime; reconcile these against CLN.
+    pub async fn list_unsettled(pool: &Pool) -> Result<Vec<Row>> {
+        let query = format!("SELECT {SELECT_COLS} FROM invoices WHERE settled_at IS NULL");
+        let rows: Vec<RowTuple> = sqlx::query_as(&query).fetch_all(pool).await?;
+        Ok(rows.into_iter().map(from_tuple).collect())
+    }
 }
 
 // =====================================================================
@@ -1406,7 +1413,7 @@ pub(crate) fn unix_now() -> i64 {
 // each test so we can use `await` inside the test body.
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
@@ -1417,7 +1424,7 @@ mod tests {
     /// lives inside a single connection's address space. A pool
     /// with multiple connections would see each as a separate
     /// empty DB, which would defeat the migration setup.
-    async fn fresh_pool() -> Pool {
+    pub(crate) async fn fresh_pool() -> Pool {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
             .unwrap()
             .create_if_missing(true)
@@ -1434,7 +1441,7 @@ mod tests {
         pool
     }
 
-    async fn make_user(pool: &Pool, login: &str) -> i64 {
+    pub(crate) async fn make_user(pool: &Pool, login: &str) -> i64 {
         users::create(pool, login, "pw").await.unwrap()
     }
 
@@ -1454,7 +1461,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn make_invoice(pool: &Pool, owner_id: i64, payment_hash: &str, amount_msat: i64) {
+    pub(crate) async fn make_invoice(pool: &Pool, owner_id: i64, payment_hash: &str, amount_msat: i64) {
         invoices::create(
             pool,
             payment_hash,

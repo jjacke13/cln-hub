@@ -27,6 +27,8 @@ mod db;
 mod http;
 mod plugin;
 mod state;
+#[cfg(test)]
+mod test_support;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

@@ -208,6 +208,10 @@ pub async fn payment_reconciler(state: Arc<AppState>) {
 /// One reconciliation pass. For each pending payment row, query CLN
 /// for its true state and finalize.
 async fn reconcile_once(state: &AppState) -> Result<()> {
+    if let Err(error) = reconcile_incoming_once(state).await {
+        // A bad invoice/RPC must not prevent outgoing-payment recovery.
+        log::warn!("incoming invoice reconciliation failed: {:#}", error);
+    }
     let pending = db::list_pending_external(&state.db).await?;
     if pending.is_empty() {
         return Ok(());
@@ -227,6 +231,75 @@ async fn reconcile_once(state: &AppState) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Replay CLN's durable paid state rather than relying on live notifications.
+async fn reconcile_incoming_once(state: &AppState) -> Result<()> {
+    for invoice in db::invoices::list_unsettled(&state.db).await? {
+        if let Err(error) = reconcile_incoming_invoice(state, &invoice).await {
+            log::warn!("incoming reconciliation failed for {}: {:#}", invoice.payment_hash, error);
+        }
+    }
+    Ok(())
+}
+
+async fn reconcile_incoming_invoice(state: &AppState, invoice: &db::invoices::Row) -> Result<()> {
+    let response = cln::call(&state.rpc_path, "listinvoices", json!({"label": invoice.label})).await?;
+    let invoices = response["invoices"].as_array()
+        .ok_or_else(|| anyhow!("listinvoices response missing invoices array"))?;
+    for paid in invoices {
+        if paid["status"].as_str() != Some("paid") {
+            continue;
+        }
+        anyhow::ensure!(paid["payment_hash"].as_str() == Some(&invoice.payment_hash),
+            "listinvoices returned a different payment hash");
+        let received = cln::parse_msat(&paid["amount_received_msat"])
+            .and_then(crate::amount::from_msat)
+            .ok_or_else(|| anyhow!("paid invoice has invalid amount_received_msat"))?;
+        db::settle_invoice(&state.db, &invoice.payment_hash, received).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn missed_invoice_notification_is_recovered_exactly_once() {
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "receiver").await;
+        // A notification arriving before its ownership row exists is also recoverable.
+        assert!(!db::settle_invoice(&pool, "incoming", 30_000).await.unwrap());
+        db::tests::make_invoice(&pool, user, "incoming", 30_000).await;
+        let (path, server) = crate::test_support::rpc(vec![(
+            "listinvoices", json!({"label": "test-incoming"}),
+            json!({"invoices": [{"payment_hash": "incoming", "status": "paid",
+                "amount_received_msat": "31000msat"}]}),
+        )]).await;
+        let state = AppState { rpc_path: path, db: pool.clone(), min_deposit_confs: 6 };
+        reconcile_incoming_once(&state).await.unwrap();
+        server.await.unwrap();
+        reconcile_incoming_once(&state).await.unwrap();
+        assert!(!db::settle_invoice(&pool, "incoming", 31_000).await.unwrap());
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 31_000);
+    }
+
+    #[tokio::test]
+    async fn malformed_paid_invoice_cannot_credit_balance() {
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "receiver").await;
+        db::tests::make_invoice(&pool, user, "incoming", 30_000).await;
+        let (path, server) = crate::test_support::rpc(vec![(
+            "listinvoices", json!({"label": "test-incoming"}),
+            json!({"invoices": [{"payment_hash": "incoming", "status": "paid"}]}),
+        )]).await;
+        let state = AppState { rpc_path: path, db: pool.clone(), min_deposit_confs: 6 };
+        reconcile_incoming_once(&state).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 0);
+        assert_eq!(db::invoices::list_unsettled(&pool).await.unwrap().len(), 1);
+    }
 }
 
 /// Ask CLN about a single payment hash. CLN's `listpays` returns one
