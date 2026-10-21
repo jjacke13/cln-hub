@@ -20,6 +20,7 @@
 // per HTTP request is negligible compared to the simplicity gain.
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -29,6 +30,10 @@ use serde_json::{json, Value};
 // implements `AsyncRead`/`AsyncWrite`.
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+// CLN normally retries routes for 60 seconds; allow headroom for a terminal result.
+const PAY_RPC_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Two error shapes from `call_strict`:
 ///
@@ -87,92 +92,119 @@ impl From<CallErr> for anyhow::Error {
 ///   - `method`: CLN method name (e.g. `"getinfo"`, `"invoice"`).
 ///   - `params`: JSON params object/array, or `json!({})` for none.
 pub async fn call_strict(socket: &Path, method: &str, params: Value) -> Result<Value, CallErr> {
-    // === Rust note: `&Path` ===
-    //
-    // `&Path` is a borrowed reference to a filesystem path — like
-    // `const std::filesystem::path&` in C++. The function doesn't take
-    // ownership; it just reads the path during the call. The owned
-    // counterpart is `PathBuf` (think `std::filesystem::path`).
-    //
-    // The `&` prefix means "reference, don't move". Rust's ownership
-    // model says values have one owner at a time; passing by reference
-    // lets a function look at a value without owning it.
-
-    // Open the socket. `await` yields control back to the runtime
-    // until the connect completes.
-    let stream = UnixStream::connect(socket)
-        .await
-        .map_err(|e| CallErr::Transport(anyhow!(e)))?;
-
-    // Split the duplex stream into independent read & write halves.
-    // Without this, the borrow checker would refuse to let us read
-    // and write concurrently — a single `&mut UnixStream` can only
-    // be used for one at a time.
-    let (read_half, mut write_half) = stream.into_split();
-
-    // Wrap the read half in `BufReader` so we get the `read_line`
-    // helper (it buffers and reads up to the next `\n`).
-    let mut reader = BufReader::new(read_half);
-
-    // Build the JSON-RPC 2.0 request envelope.
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params,
-    });
-
-    // Serialize to bytes and append a newline. CLN delimits messages
-    // by newline on this socket.
-    let mut bytes = serde_json::to_vec(&request).map_err(|e| CallErr::Transport(anyhow!(e)))?;
-    bytes.push(b'\n');
-    write_half
-        .write_all(&bytes)
-        .await
-        .map_err(|e| CallErr::Transport(anyhow!(e)))?;
-
-    // Read one line of response. CLN's long-running RPCs (e.g. `pay`)
-    // hold the line open until terminal — that's fine, we just block
-    // here for as long as it takes.
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .map_err(|e| CallErr::Transport(anyhow!(e)))?;
-    let resp: Value =
-        serde_json::from_str(&line).map_err(|e| CallErr::Transport(anyhow!(e)))?;
-
-    // JSON-RPC 2.0 responses contain either `result` or `error`,
-    // never both. Pluck the appropriate one.
-    if let Some(result) = resp.get("result") {
-        Ok(result.clone())
-    } else if let Some(error) = resp.get("error") {
-        // Structured error — preserve code + message for the caller.
-        let code = error.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
-        let message = error
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unspecified lightningd error")
-            .to_string();
-        let data = error.get("data").cloned().unwrap_or(Value::Null);
-        Err(CallErr::Rpc {
-            code,
-            message,
-            data,
-        })
+    let deadline = if method == "pay" {
+        PAY_RPC_TIMEOUT
     } else {
-        Err(CallErr::Transport(anyhow!(
-            "malformed lightningd response: {}",
-            resp
-        )))
-    }
+        RPC_TIMEOUT
+    };
+    call_with_timeout(socket, method, params, deadline).await
+}
+
+async fn call_with_timeout(
+    socket: &Path,
+    method: &str,
+    params: Value,
+    deadline: Duration,
+) -> Result<Value, CallErr> {
+    // A timeout drops the unfinished future and socket; it cannot cancel an
+    // accepted CLN payment. Transport errors therefore keep funds reserved.
+    tokio::time::timeout(deadline, async {
+        // === Rust note: `&Path` ===
+        //
+        // `&Path` is a borrowed reference to a filesystem path — like
+        // `const std::filesystem::path&` in C++. The function doesn't take
+        // ownership; it just reads the path during the call. The owned
+        // counterpart is `PathBuf` (think `std::filesystem::path`).
+        //
+        // The `&` prefix means "reference, don't move". Rust's ownership
+        // model says values have one owner at a time; passing by reference
+        // lets a function look at a value without owning it.
+
+        // Open the socket. `await` yields control back to the runtime
+        // until the connect completes.
+        let stream = UnixStream::connect(socket)
+            .await
+            .map_err(|e| CallErr::Transport(anyhow!(e)))?;
+
+        // Split the duplex stream into independent read & write halves.
+        // Without this, the borrow checker would refuse to let us read
+        // and write concurrently — a single `&mut UnixStream` can only
+        // be used for one at a time.
+        let (read_half, mut write_half) = stream.into_split();
+
+        // Wrap the read half in `BufReader` so we get the `read_line`
+        // helper (it buffers and reads up to the next `\n`).
+        let mut reader = BufReader::new(read_half);
+
+        // Build the JSON-RPC 2.0 request envelope.
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+
+        // Serialize to bytes and append a newline. CLN delimits messages
+        // by newline on this socket.
+        let mut bytes = serde_json::to_vec(&request).map_err(|e| CallErr::Transport(anyhow!(e)))?;
+        bytes.push(b'\n');
+        write_half
+            .write_all(&bytes)
+            .await
+            .map_err(|e| CallErr::Transport(anyhow!(e)))?;
+
+        // The single deadline covers connect, write and read, rather than
+        // restarting whenever a slow peer sends another byte.
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| CallErr::Transport(anyhow!(e)))?;
+        let resp: Value =
+            serde_json::from_str(&line).map_err(|e| CallErr::Transport(anyhow!(e)))?;
+
+        // JSON-RPC 2.0 responses contain either `result` or `error`,
+        // never both. Pluck the appropriate one.
+        if let Some(result) = resp.get("result") {
+            Ok(result.clone())
+        } else if let Some(error) = resp.get("error") {
+            // Structured error — preserve code + message for the caller.
+            let code = error.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+            let message = error
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unspecified lightningd error")
+                .to_string();
+            let data = error.get("data").cloned().unwrap_or(Value::Null);
+            Err(CallErr::Rpc {
+                code,
+                message,
+                data,
+            })
+        } else {
+            Err(CallErr::Transport(anyhow!(
+                "malformed lightningd response: {}",
+                resp
+            )))
+        }
+    })
+    .await
+    .map_err(|_| {
+        CallErr::Transport(anyhow!(
+            "CLN {} RPC timed out after {}s; outcome is unknown",
+            method,
+            deadline.as_secs_f64()
+        ))
+    })?
 }
 
 /// Thin wrapper over `call_strict` that collapses both error variants
 /// into `anyhow::Error`. Most callers don't care about the RPC code,
 /// so this is the friendlier signature.
 pub async fn call(socket: &Path, method: &str, params: Value) -> Result<Value> {
-    call_strict(socket, method, params).await.map_err(Into::into)
+    call_strict(socket, method, params)
+        .await
+        .map_err(Into::into)
 }
 
 /// Validate a successful payment's amount before calculating its fee.
@@ -180,7 +212,9 @@ pub fn payment_fee_msat(response: &Value, amount: i64, reserve: i64) -> Result<i
     let sent = parse_msat(&response["amount_sent_msat"])
         .and_then(crate::amount::from_msat)
         .ok_or_else(|| anyhow!("missing or invalid amount_sent_msat"))?;
-    let fee = sent.checked_sub(amount).filter(|n| *n >= 0 && *n <= reserve)
+    let fee = sent
+        .checked_sub(amount)
+        .filter(|n| *n >= 0 && *n <= reserve)
         .ok_or_else(|| anyhow!("CLN payment amount or fee disagrees with reservation"))?;
     Ok(fee)
 }
@@ -220,7 +254,10 @@ pub fn validate_preimage(v: &Value) -> Option<String> {
     if s.len() != 64 {
         return None;
     }
-    if !s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
         return None;
     }
     Some(s.to_string())
@@ -229,12 +266,114 @@ pub fn validate_preimage(v: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn deadline_closes_a_socket_that_never_replies() {
+        let path =
+            std::env::temp_dir().join(format!("cln-timeout-{}.sock", crate::db::random_hex(8)));
+        let listener = UnixListener::bind(&path).unwrap();
+        let cleanup = path.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request = String::new();
+            socket.read_line(&mut request).await.unwrap();
+            let mut byte = [0];
+            assert_eq!(
+                socket.read(&mut byte).await.unwrap(),
+                0,
+                "timeout must close the client socket"
+            );
+            std::fs::remove_file(cleanup).unwrap();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            call_with_timeout(&path, "getinfo", json!({}), Duration::from_millis(50)),
+        )
+        .await
+        .expect("RPC did not respect its deadline");
+        assert!(matches!(result, Err(CallErr::Transport(error))
+            if error.to_string().contains("getinfo RPC timed out")));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deadline_also_covers_a_blocked_request_write() {
+        let path = std::env::temp_dir().join(format!(
+            "cln-write-timeout-{}.sock",
+            crate::db::random_hex(8)
+        ));
+        let listener = UnixListener::bind(&path).unwrap();
+        let cleanup = path.clone();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            // Do not drain the request: it must fill the Unix socket's send buffer.
+            let _ = released.await;
+            std::fs::remove_file(cleanup).unwrap();
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            call_with_timeout(
+                &path,
+                "pay",
+                json!({"bolt11": "x".repeat(2 * 1024 * 1024)}),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("RPC write did not respect its deadline");
+        assert!(matches!(result, Err(CallErr::Transport(error))
+            if error.to_string().contains("pay RPC timed out")));
+        release.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deadline_preserves_success_and_structured_rpc_errors() {
+        let (path, server) =
+            crate::test_support::rpc(vec![("getinfo", json!({}), json!({"network": "regtest"}))])
+                .await;
+        let response = call_with_timeout(&path, "getinfo", json!({}), Duration::from_secs(2)).await;
+        assert!(matches!(response, Ok(value) if value["network"] == "regtest"));
+        server.await.unwrap();
+
+        let path =
+            std::env::temp_dir().join(format!("cln-error-{}.sock", crate::db::random_hex(8)));
+        let listener = UnixListener::bind(&path).unwrap();
+        let cleanup = path.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request = String::new();
+            socket.read_line(&mut request).await.unwrap();
+            socket.get_mut().write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":210,\"message\":\"pending\",\"data\":{\"attempt\":1}}}\n").await.unwrap();
+            std::fs::remove_file(cleanup).unwrap();
+        });
+        let response = call_with_timeout(&path, "pay", json!({}), Duration::from_secs(2)).await;
+        assert!(
+            matches!(response, Err(CallErr::Rpc { code: 210, data, .. }) if data["attempt"] == 1)
+        );
+        server.await.unwrap();
+    }
 
     #[test]
     fn fee_requires_a_bounded_consistent_sent_amount() {
-        assert_eq!(payment_fee_msat(&json!({"amount_sent_msat": 1100}), 1000, 500).unwrap(), 100);
-        for response in [json!({}), json!({"amount_sent_msat": u64::MAX}),
-            json!({"amount_sent_msat": 999}), json!({"amount_sent_msat": 1600})] {
+        assert_eq!(
+            payment_fee_msat(&json!({"amount_sent_msat": 1100}), 1000, 500).unwrap(),
+            100
+        );
+        for response in [
+            json!({}),
+            json!({"amount_sent_msat": u64::MAX}),
+            json!({"amount_sent_msat": 999}),
+            json!({"amount_sent_msat": 1600}),
+        ] {
             assert!(payment_fee_msat(&response, 1000, 500).is_err());
         }
     }

@@ -430,128 +430,6 @@ fn parse_amount_sats_to_msat(v: &Value) -> Result<Option<i64>, AppError> {
     }
 }
 
-#[cfg(test)]
-mod amount_tests {
-    use super::*;
-
-    #[test]
-    fn rejects_amounts_that_previously_overflowed_the_reservation() {
-        for value in [
-            json!(9_223_372_036_854_776_u64),
-            json!(u64::MAX),
-            json!("9223372036854776"),
-            json!(0),
-            json!(-1),
-        ] {
-            assert!(parse_amount_sats_to_msat(&value).is_err());
-        }
-        assert!(matches!(
-            parse_amount_sats_to_msat(&json!(1)),
-            Ok(Some(1000))
-        ));
-        assert!(matches!(parse_amount_sats_to_msat(&Value::Null), Ok(None)));
-    }
-
-    #[tokio::test]
-    async fn hub_transfer_uses_native_self_payment_and_real_receipt() {
-        let pool = db::tests::fresh_pool().await;
-        let payer = db::tests::make_user(&pool, "payer").await;
-        let receiver = db::tests::make_user(&pool, "receiver").await;
-        db::tests::seed_balance(&pool, payer, 30_000).await;
-        db::tests::make_invoice(&pool, receiver, "local", 30_000).await;
-        let preimage = "ab".repeat(32);
-        let (path, server) = crate::test_support::rpc(vec![
-            (
-                "decode",
-                json!({"string": "lnbc-test"}),
-                json!({"valid": true, "payment_hash": "local", "amount_msat": 30_000}),
-            ),
-            (
-                "pay",
-                json!({"bolt11": "lnbc-test", "maxfee": 0, "label": "cln-hub:payment:1"}),
-                json!({"payment_preimage": preimage, "amount_sent_msat": 30_000}),
-            ),
-        ])
-        .await;
-        let state = Arc::new(AppState {
-            rpc_path: path,
-            db: pool.clone(),
-            min_deposit_confs: 6,
-        });
-        let result = payinvoice(
-            State(state),
-            AuthUser { user_id: payer },
-            Json(PayInvoiceReq {
-                invoice: "lnbc-test".into(),
-                amount: Value::Null,
-            }),
-        )
-        .await;
-        let response = match result {
-            Ok(Json(value)) => value,
-            Err(_) => panic!("self-payment failed"),
-        };
-        server.await.unwrap();
-        assert_eq!(response["payment_preimage"], preimage);
-        assert_eq!(response["payment_route"]["total_fees_msat"], 0);
-        // CLN's notification and periodic recovery both use this idempotent receipt path.
-        assert!(db::settle_invoice(&pool, "local", 30_000).await.unwrap());
-        assert!(!db::settle_invoice(&pool, "local", 30_000).await.unwrap());
-        assert_eq!(db::balance_msat(&pool, payer).await.unwrap(), 0);
-        assert_eq!(db::balance_msat(&pool, receiver).await.unwrap(), 30_000);
-        assert_eq!(
-            db::payments::list_for_user(&pool, payer).await.unwrap()[0].status,
-            "internal"
-        );
-    }
-
-    #[tokio::test]
-    async fn invalid_local_payment_never_calls_pay() {
-        for case in ["self", "expired", "paid", "insufficient"] {
-            let pool = db::tests::fresh_pool().await;
-            let payer = db::tests::make_user(&pool, "payer").await;
-            let receiver = if case == "self" {
-                payer
-            } else {
-                db::tests::make_user(&pool, "receiver").await
-            };
-            db::tests::make_invoice(&pool, receiver, "local", 30_000).await;
-            if case == "expired" {
-                sqlx::query("UPDATE invoices SET expires_at=1")
-                    .execute(&pool)
-                    .await
-                    .unwrap();
-            }
-            if case == "paid" {
-                db::settle_invoice(&pool, "local", 30_000).await.unwrap();
-            }
-            let (path, server) = crate::test_support::rpc(vec![(
-                "decode",
-                json!({"string": "lnbc-test"}),
-                json!({"valid": true, "payment_hash": "local", "amount_msat": 30_000}),
-            )])
-            .await;
-            let state = Arc::new(AppState {
-                rpc_path: path,
-                db: pool.clone(),
-                min_deposit_confs: 6,
-            });
-            assert!(payinvoice(
-                State(state),
-                AuthUser { user_id: payer },
-                Json(PayInvoiceReq {
-                    invoice: "lnbc-test".into(),
-                    amount: Value::Null
-                })
-            )
-            .await
-            .is_err());
-            server.await.unwrap();
-            assert!(db::list_pending_external(&pool).await.unwrap().is_empty());
-        }
-    }
-}
-
 // =====================================================================
 // /getbalance
 // =====================================================================
@@ -740,4 +618,171 @@ pub(super) async fn gettxs(
 
     let arr: Vec<Value> = entries.into_iter().map(|(_, v)| v).collect();
     Ok(Json(Value::Array(arr)))
+}
+
+#[cfg(test)]
+mod amount_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ambiguous_rpc_transport_failure_keeps_the_reservation() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "payer").await;
+        db::tests::seed_balance(&pool, user, 100_000).await;
+        let path =
+            std::env::temp_dir().join(format!("cln-pay-disconnect-{}.sock", db::random_hex(8)));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let cleanup = path.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request = String::new();
+            socket.read_line(&mut request).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&request).unwrap()["method"],
+                "pay"
+            );
+            // CLN may have accepted the payment; disconnect without declaring an outcome.
+            std::fs::remove_file(cleanup).unwrap();
+        });
+        let state = Arc::new(AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        });
+        let result = external_pay(
+            &state,
+            user,
+            "hash",
+            "lnbc-test",
+            "",
+            "",
+            30_000,
+            false,
+            false,
+        )
+        .await;
+        server.await.unwrap();
+        assert!(matches!(result, Err(AppError::Payment { code: 6, .. })));
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 65_000);
+        assert_eq!(db::list_pending_external(&pool).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rejects_amounts_that_previously_overflowed_the_reservation() {
+        for value in [
+            json!(9_223_372_036_854_776_u64),
+            json!(u64::MAX),
+            json!("9223372036854776"),
+            json!(0),
+            json!(-1),
+        ] {
+            assert!(parse_amount_sats_to_msat(&value).is_err());
+        }
+        assert!(matches!(
+            parse_amount_sats_to_msat(&json!(1)),
+            Ok(Some(1000))
+        ));
+        assert!(matches!(parse_amount_sats_to_msat(&Value::Null), Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn hub_transfer_uses_native_self_payment_and_real_receipt() {
+        let pool = db::tests::fresh_pool().await;
+        let payer = db::tests::make_user(&pool, "payer").await;
+        let receiver = db::tests::make_user(&pool, "receiver").await;
+        db::tests::seed_balance(&pool, payer, 30_000).await;
+        db::tests::make_invoice(&pool, receiver, "local", 30_000).await;
+        let preimage = "ab".repeat(32);
+        let (path, server) = crate::test_support::rpc(vec![
+            (
+                "decode",
+                json!({"string": "lnbc-test"}),
+                json!({"valid": true, "payment_hash": "local", "amount_msat": 30_000}),
+            ),
+            (
+                "pay",
+                json!({"bolt11": "lnbc-test", "maxfee": 0, "label": "cln-hub:payment:1"}),
+                json!({"payment_preimage": preimage, "amount_sent_msat": 30_000}),
+            ),
+        ])
+        .await;
+        let state = Arc::new(AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        });
+        let result = payinvoice(
+            State(state),
+            AuthUser { user_id: payer },
+            Json(PayInvoiceReq {
+                invoice: "lnbc-test".into(),
+                amount: Value::Null,
+            }),
+        )
+        .await;
+        let response = match result {
+            Ok(Json(value)) => value,
+            Err(_) => panic!("self-payment failed"),
+        };
+        server.await.unwrap();
+        assert_eq!(response["payment_preimage"], preimage);
+        assert_eq!(response["payment_route"]["total_fees_msat"], 0);
+        // CLN's notification and periodic recovery both use this idempotent receipt path.
+        assert!(db::settle_invoice(&pool, "local", 30_000).await.unwrap());
+        assert!(!db::settle_invoice(&pool, "local", 30_000).await.unwrap());
+        assert_eq!(db::balance_msat(&pool, payer).await.unwrap(), 0);
+        assert_eq!(db::balance_msat(&pool, receiver).await.unwrap(), 30_000);
+        assert_eq!(
+            db::payments::list_for_user(&pool, payer).await.unwrap()[0].status,
+            "internal"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_local_payment_never_calls_pay() {
+        for case in ["self", "expired", "paid", "insufficient"] {
+            let pool = db::tests::fresh_pool().await;
+            let payer = db::tests::make_user(&pool, "payer").await;
+            let receiver = if case == "self" {
+                payer
+            } else {
+                db::tests::make_user(&pool, "receiver").await
+            };
+            db::tests::make_invoice(&pool, receiver, "local", 30_000).await;
+            if case == "expired" {
+                sqlx::query("UPDATE invoices SET expires_at=1")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            if case == "paid" {
+                db::settle_invoice(&pool, "local", 30_000).await.unwrap();
+            }
+            let (path, server) = crate::test_support::rpc(vec![(
+                "decode",
+                json!({"string": "lnbc-test"}),
+                json!({"valid": true, "payment_hash": "local", "amount_msat": 30_000}),
+            )])
+            .await;
+            let state = Arc::new(AppState {
+                rpc_path: path,
+                db: pool.clone(),
+                min_deposit_confs: 6,
+            });
+            assert!(payinvoice(
+                State(state),
+                AuthUser { user_id: payer },
+                Json(PayInvoiceReq {
+                    invoice: "lnbc-test".into(),
+                    amount: Value::Null
+                })
+            )
+            .await
+            .is_err());
+            server.await.unwrap();
+            assert!(db::list_pending_external(&pool).await.unwrap().is_empty());
+        }
+    }
 }

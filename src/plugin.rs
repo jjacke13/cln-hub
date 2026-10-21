@@ -273,338 +273,6 @@ async fn reconcile_incoming_invoice(state: &AppState, invoice: &db::invoices::Ro
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn spent_deposit_recovery_uses_original_height_and_is_idempotent() {
-        let pool = db::tests::fresh_pool().await;
-        let user = db::tests::make_user(&pool, "receiver").await;
-        db::addresses::create(&pool, user, "regtest-deposit")
-            .await
-            .unwrap();
-        let spent_hash = "de".repeat(32);
-        let confirmed_hash = "cf".repeat(32);
-        let outputs = json!({"outputs": [
-            {"txid": spent_hash, "output": 0, "address": "regtest-deposit",
-             "amount_msat": 30_000, "status": "spent"},
-            {"txid": confirmed_hash, "output": 1, "address": "regtest-deposit",
-             "amount_msat": 20_000, "status": "confirmed", "blockheight": 100}
-        ]});
-        let mut steps = Vec::new();
-        for _ in 0..2 {
-            steps.extend([
-                ("getinfo", json!({}), json!({"blockheight": 110})),
-                ("listfunds", json!({"spent": true}), outputs.clone()),
-                (
-                    "listtransactions",
-                    json!({}),
-                    json!({"transactions": [
-                        {"hash": spent_hash, "blockheight": 100}
-                    ]}),
-                ),
-            ]);
-        }
-        let (path, server) = crate::test_support::rpc(steps).await;
-        let state = AppState {
-            rpc_path: path,
-            db: pool.clone(),
-            min_deposit_confs: 6,
-        };
-        scan_once(&state).await.unwrap();
-        scan_once(&state).await.unwrap();
-        server.await.unwrap();
-        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 50_000);
-        let deposits = db::onchain_credits::list_for_user(&pool, user)
-            .await
-            .unwrap();
-        assert_eq!(deposits.len(), 2);
-        assert!(deposits
-            .iter()
-            .all(|deposit| deposit.blockheight == Some(100)));
-    }
-
-    #[tokio::test]
-    async fn spent_output_still_requires_a_known_sufficiently_confirmed_deposit() {
-        let pool = db::tests::fresh_pool().await;
-        let user = db::tests::make_user(&pool, "receiver").await;
-        db::addresses::create(&pool, user, "regtest-deposit")
-            .await
-            .unwrap();
-        let output = json!({"txid": "unknown", "output": 0, "address": "regtest-deposit",
-            "amount_msat": 30_000, "status": "spent"});
-        let mut outputs = Vec::new();
-        for (hash, height) in [
-            ("unknown", None),
-            ("unconfirmed", Some(0)),
-            ("shallow", Some(108)),
-            ("future", Some(111)),
-            ("negative", Some(-1)),
-        ] {
-            let mut entry = output.clone();
-            entry["txid"] = json!(hash);
-            if let Some(height) = height {
-                entry["blockheight"] = json!(height);
-            }
-            outputs.push(entry);
-        }
-        let mut no_index = output.clone();
-        no_index.as_object_mut().unwrap().remove("output");
-        no_index["blockheight"] = json!(100);
-        outputs.push(no_index);
-        let (path, server) = crate::test_support::rpc(vec![
-            ("getinfo", json!({}), json!({"blockheight": 110})),
-            (
-                "listfunds",
-                json!({"spent": true}),
-                json!({"outputs": outputs}),
-            ),
-            (
-                "listtransactions",
-                json!({}),
-                json!({"transactions": [
-                    {"hash": "unconfirmed", "blockheight": 0},
-                    {"hash": "unrelated-spend", "blockheight": 100}
-                ]}),
-            ),
-        ])
-        .await;
-        let state = AppState {
-            rpc_path: path,
-            db: pool.clone(),
-            min_deposit_confs: 6,
-        };
-        scan_once(&state).await.unwrap();
-        server.await.unwrap();
-        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 0);
-        assert!(db::onchain_credits::list_for_user(&pool, user)
-            .await
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn malformed_transaction_history_cannot_supply_deposit_confirmations() {
-        let pool = db::tests::fresh_pool().await;
-        let (path, server) = crate::test_support::rpc(vec![
-            ("getinfo", json!({}), json!({"blockheight": 110})),
-            (
-                "listfunds",
-                json!({"spent": true}),
-                json!({"outputs": [
-                    {"txid": "unknown", "status": "spent"}
-                ]}),
-            ),
-            ("listtransactions", json!({}), json!({"transactions": null})),
-        ])
-        .await;
-        let state = AppState {
-            rpc_path: path,
-            db: pool,
-            min_deposit_confs: 6,
-        };
-        assert!(scan_once(&state).await.is_err());
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn reconciler_matches_the_current_attempt_label() {
-        let pool = db::tests::fresh_pool().await;
-        let user = db::tests::make_user(&pool, "payer").await;
-        db::tests::seed_balance(&pool, user, 100_000).await;
-        db::reserve_external_pay(&pool, user, "same", "lnbc", "", 30_000, 5000)
-            .await
-            .unwrap();
-        let old = db::list_pending_external(&pool)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        db::fail_external_pay(&pool, old.id).await.unwrap();
-        db::reserve_external_pay(&pool, user, "same", "lnbc", "", 70_000, 5000)
-            .await
-            .unwrap();
-        let new = db::list_pending_external(&pool)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        let old_status =
-            json!({"payment_hash": "same", "label": old.cln_label, "status": "failed"});
-        let paid_status = json!({"payment_hash": "same", "label": new.cln_label, "status": "complete",
-            "preimage": "ab".repeat(32), "amount_sent_msat": 72_000});
-        let (path, server) = crate::test_support::rpc(vec![
-            (
-                "listpays",
-                json!({"payment_hash": "same"}),
-                json!({"pays": [old_status.clone()]}),
-            ),
-            (
-                "listpays",
-                json!({"payment_hash": "same"}),
-                json!({"pays": [old_status, paid_status]}),
-            ),
-        ])
-        .await;
-        let state = AppState {
-            rpc_path: path,
-            db: pool.clone(),
-            min_deposit_confs: 6,
-        };
-        reconcile_one(&state, &new).await.unwrap();
-        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 25_000);
-        assert_eq!(
-            db::list_pending_external(&pool).await.unwrap()[0].id,
-            new.id
-        );
-        reconcile_one(&state, &new).await.unwrap();
-        server.await.unwrap();
-        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 28_000);
-        assert!(db::list_pending_external(&pool).await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn malformed_listpays_never_refunds_or_counts_as_empty() {
-        let pool = db::tests::fresh_pool().await;
-        let user = db::tests::make_user(&pool, "payer").await;
-        db::tests::seed_balance(&pool, user, 100_000).await;
-        db::reserve_external_pay(&pool, user, "hash", "lnbc", "", 30_000, 5000)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE payments SET created_at=?, empty_listpays_sweeps=2")
-            .bind(db::unix_now() - 600)
-            .execute(&pool)
-            .await
-            .unwrap();
-        let pending = db::list_pending_external(&pool)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        let responses = [
-            json!({}),
-            json!({"pays": null}),
-            json!({"pays": {}}),
-            json!({"pays": [{"payment_hash": "other", "status": "failed"}]}),
-            json!({"pays": [{"payment_hash": "hash"}]}),
-        ];
-        let steps = responses
-            .into_iter()
-            .map(|response| ("listpays", json!({"payment_hash": "hash"}), response))
-            .collect();
-        let (path, server) = crate::test_support::rpc(steps).await;
-        let state = AppState {
-            rpc_path: path,
-            db: pool.clone(),
-            min_deposit_confs: 6,
-        };
-        for _ in 0..5 {
-            assert!(reconcile_one(&state, &pending).await.is_err());
-        }
-        server.await.unwrap();
-        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 65_000);
-        assert_eq!(db::list_pending_external(&pool).await.unwrap().len(), 1);
-        let (sweeps,): (i64,) = sqlx::query_as("SELECT empty_listpays_sweeps FROM payments")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(sweeps, 0);
-    }
-
-    #[tokio::test]
-    async fn valid_empty_listpays_still_requires_three_old_sweeps() {
-        let pool = db::tests::fresh_pool().await;
-        let user = db::tests::make_user(&pool, "payer").await;
-        db::tests::seed_balance(&pool, user, 100_000).await;
-        db::reserve_external_pay(&pool, user, "hash", "lnbc", "", 30_000, 5000)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE payments SET created_at=?")
-            .bind(db::unix_now() - 600)
-            .execute(&pool)
-            .await
-            .unwrap();
-        let pending = db::list_pending_external(&pool)
-            .await
-            .unwrap()
-            .pop()
-            .unwrap();
-        let (path, server) = crate::test_support::rpc(
-            (0..3)
-                .map(|_| {
-                    (
-                        "listpays",
-                        json!({"payment_hash": "hash"}),
-                        json!({"pays": []}),
-                    )
-                })
-                .collect(),
-        )
-        .await;
-        let state = AppState {
-            rpc_path: path,
-            db: pool.clone(),
-            min_deposit_confs: 6,
-        };
-        for _ in 0..2 {
-            reconcile_one(&state, &pending).await.unwrap();
-            assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 65_000);
-        }
-        reconcile_one(&state, &pending).await.unwrap();
-        server.await.unwrap();
-        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 100_000);
-    }
-
-    #[tokio::test]
-    async fn missed_invoice_notification_is_recovered_exactly_once() {
-        let pool = db::tests::fresh_pool().await;
-        let user = db::tests::make_user(&pool, "receiver").await;
-        // A notification arriving before its ownership row exists is also recoverable.
-        assert!(!db::settle_invoice(&pool, "incoming", 30_000).await.unwrap());
-        db::tests::make_invoice(&pool, user, "incoming", 30_000).await;
-        let (path, server) = crate::test_support::rpc(vec![(
-            "listinvoices",
-            json!({"label": "test-incoming"}),
-            json!({"invoices": [{"payment_hash": "incoming", "status": "paid",
-                "amount_received_msat": "31000msat"}]}),
-        )])
-        .await;
-        let state = AppState {
-            rpc_path: path,
-            db: pool.clone(),
-            min_deposit_confs: 6,
-        };
-        reconcile_incoming_once(&state).await.unwrap();
-        server.await.unwrap();
-        reconcile_incoming_once(&state).await.unwrap();
-        assert!(!db::settle_invoice(&pool, "incoming", 31_000).await.unwrap());
-        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 31_000);
-    }
-
-    #[tokio::test]
-    async fn malformed_paid_invoice_cannot_credit_balance() {
-        let pool = db::tests::fresh_pool().await;
-        let user = db::tests::make_user(&pool, "receiver").await;
-        db::tests::make_invoice(&pool, user, "incoming", 30_000).await;
-        let (path, server) = crate::test_support::rpc(vec![(
-            "listinvoices",
-            json!({"label": "test-incoming"}),
-            json!({"invoices": [{"payment_hash": "incoming", "status": "paid"}]}),
-        )])
-        .await;
-        let state = AppState {
-            rpc_path: path,
-            db: pool.clone(),
-            min_deposit_confs: 6,
-        };
-        reconcile_incoming_once(&state).await.unwrap();
-        server.await.unwrap();
-        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 0);
-        assert_eq!(db::invoices::list_unsettled(&pool).await.unwrap().len(), 1);
-    }
-}
-
 /// Ask CLN about a single payment hash. CLN's `listpays` returns one
 /// or more attempt records under `.pays`; we look at the most recent
 /// one and act on its `status`.
@@ -940,4 +608,336 @@ async fn scan_once(state: &AppState) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn spent_deposit_recovery_uses_original_height_and_is_idempotent() {
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "receiver").await;
+        db::addresses::create(&pool, user, "regtest-deposit")
+            .await
+            .unwrap();
+        let spent_hash = "de".repeat(32);
+        let confirmed_hash = "cf".repeat(32);
+        let outputs = json!({"outputs": [
+            {"txid": spent_hash, "output": 0, "address": "regtest-deposit",
+             "amount_msat": 30_000, "status": "spent"},
+            {"txid": confirmed_hash, "output": 1, "address": "regtest-deposit",
+             "amount_msat": 20_000, "status": "confirmed", "blockheight": 100}
+        ]});
+        let mut steps = Vec::new();
+        for _ in 0..2 {
+            steps.extend([
+                ("getinfo", json!({}), json!({"blockheight": 110})),
+                ("listfunds", json!({"spent": true}), outputs.clone()),
+                (
+                    "listtransactions",
+                    json!({}),
+                    json!({"transactions": [
+                        {"hash": spent_hash, "blockheight": 100}
+                    ]}),
+                ),
+            ]);
+        }
+        let (path, server) = crate::test_support::rpc(steps).await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        };
+        scan_once(&state).await.unwrap();
+        scan_once(&state).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 50_000);
+        let deposits = db::onchain_credits::list_for_user(&pool, user)
+            .await
+            .unwrap();
+        assert_eq!(deposits.len(), 2);
+        assert!(deposits
+            .iter()
+            .all(|deposit| deposit.blockheight == Some(100)));
+    }
+
+    #[tokio::test]
+    async fn spent_output_still_requires_a_known_sufficiently_confirmed_deposit() {
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "receiver").await;
+        db::addresses::create(&pool, user, "regtest-deposit")
+            .await
+            .unwrap();
+        let output = json!({"txid": "unknown", "output": 0, "address": "regtest-deposit",
+            "amount_msat": 30_000, "status": "spent"});
+        let mut outputs = Vec::new();
+        for (hash, height) in [
+            ("unknown", None),
+            ("unconfirmed", Some(0)),
+            ("shallow", Some(108)),
+            ("future", Some(111)),
+            ("negative", Some(-1)),
+        ] {
+            let mut entry = output.clone();
+            entry["txid"] = json!(hash);
+            if let Some(height) = height {
+                entry["blockheight"] = json!(height);
+            }
+            outputs.push(entry);
+        }
+        let mut no_index = output.clone();
+        no_index.as_object_mut().unwrap().remove("output");
+        no_index["blockheight"] = json!(100);
+        outputs.push(no_index);
+        let (path, server) = crate::test_support::rpc(vec![
+            ("getinfo", json!({}), json!({"blockheight": 110})),
+            (
+                "listfunds",
+                json!({"spent": true}),
+                json!({"outputs": outputs}),
+            ),
+            (
+                "listtransactions",
+                json!({}),
+                json!({"transactions": [
+                    {"hash": "unconfirmed", "blockheight": 0},
+                    {"hash": "unrelated-spend", "blockheight": 100}
+                ]}),
+            ),
+        ])
+        .await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        };
+        scan_once(&state).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 0);
+        assert!(db::onchain_credits::list_for_user(&pool, user)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_transaction_history_cannot_supply_deposit_confirmations() {
+        let pool = db::tests::fresh_pool().await;
+        let (path, server) = crate::test_support::rpc(vec![
+            ("getinfo", json!({}), json!({"blockheight": 110})),
+            (
+                "listfunds",
+                json!({"spent": true}),
+                json!({"outputs": [
+                    {"txid": "unknown", "status": "spent"}
+                ]}),
+            ),
+            ("listtransactions", json!({}), json!({"transactions": null})),
+        ])
+        .await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool,
+            min_deposit_confs: 6,
+        };
+        assert!(scan_once(&state).await.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconciler_matches_the_current_attempt_label() {
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "payer").await;
+        db::tests::seed_balance(&pool, user, 100_000).await;
+        db::reserve_external_pay(&pool, user, "same", "lnbc", "", 30_000, 5000)
+            .await
+            .unwrap();
+        let old = db::list_pending_external(&pool)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        db::fail_external_pay(&pool, old.id).await.unwrap();
+        db::reserve_external_pay(&pool, user, "same", "lnbc", "", 70_000, 5000)
+            .await
+            .unwrap();
+        let new = db::list_pending_external(&pool)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let old_status =
+            json!({"payment_hash": "same", "label": old.cln_label, "status": "failed"});
+        let paid_status = json!({"payment_hash": "same", "label": new.cln_label, "status": "complete",
+            "preimage": "ab".repeat(32), "amount_sent_msat": 72_000});
+        let (path, server) = crate::test_support::rpc(vec![
+            (
+                "listpays",
+                json!({"payment_hash": "same"}),
+                json!({"pays": [old_status.clone()]}),
+            ),
+            (
+                "listpays",
+                json!({"payment_hash": "same"}),
+                json!({"pays": [old_status, paid_status]}),
+            ),
+        ])
+        .await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        };
+        reconcile_one(&state, &new).await.unwrap();
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 25_000);
+        assert_eq!(
+            db::list_pending_external(&pool).await.unwrap()[0].id,
+            new.id
+        );
+        reconcile_one(&state, &new).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 28_000);
+        assert!(db::list_pending_external(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_listpays_never_refunds_or_counts_as_empty() {
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "payer").await;
+        db::tests::seed_balance(&pool, user, 100_000).await;
+        db::reserve_external_pay(&pool, user, "hash", "lnbc", "", 30_000, 5000)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE payments SET created_at=?, empty_listpays_sweeps=2")
+            .bind(db::unix_now() - 600)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pending = db::list_pending_external(&pool)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let responses = [
+            json!({}),
+            json!({"pays": null}),
+            json!({"pays": {}}),
+            json!({"pays": [{"payment_hash": "other", "status": "failed"}]}),
+            json!({"pays": [{"payment_hash": "hash"}]}),
+        ];
+        let steps = responses
+            .into_iter()
+            .map(|response| ("listpays", json!({"payment_hash": "hash"}), response))
+            .collect();
+        let (path, server) = crate::test_support::rpc(steps).await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        };
+        for _ in 0..5 {
+            assert!(reconcile_one(&state, &pending).await.is_err());
+        }
+        server.await.unwrap();
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 65_000);
+        assert_eq!(db::list_pending_external(&pool).await.unwrap().len(), 1);
+        let (sweeps,): (i64,) = sqlx::query_as("SELECT empty_listpays_sweeps FROM payments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sweeps, 0);
+    }
+
+    #[tokio::test]
+    async fn valid_empty_listpays_still_requires_three_old_sweeps() {
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "payer").await;
+        db::tests::seed_balance(&pool, user, 100_000).await;
+        db::reserve_external_pay(&pool, user, "hash", "lnbc", "", 30_000, 5000)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE payments SET created_at=?")
+            .bind(db::unix_now() - 600)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pending = db::list_pending_external(&pool)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let (path, server) = crate::test_support::rpc(
+            (0..3)
+                .map(|_| {
+                    (
+                        "listpays",
+                        json!({"payment_hash": "hash"}),
+                        json!({"pays": []}),
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        };
+        for _ in 0..2 {
+            reconcile_one(&state, &pending).await.unwrap();
+            assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 65_000);
+        }
+        reconcile_one(&state, &pending).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn missed_invoice_notification_is_recovered_exactly_once() {
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "receiver").await;
+        // A notification arriving before its ownership row exists is also recoverable.
+        assert!(!db::settle_invoice(&pool, "incoming", 30_000).await.unwrap());
+        db::tests::make_invoice(&pool, user, "incoming", 30_000).await;
+        let (path, server) = crate::test_support::rpc(vec![(
+            "listinvoices",
+            json!({"label": "test-incoming"}),
+            json!({"invoices": [{"payment_hash": "incoming", "status": "paid",
+                "amount_received_msat": "31000msat"}]}),
+        )])
+        .await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        };
+        reconcile_incoming_once(&state).await.unwrap();
+        server.await.unwrap();
+        reconcile_incoming_once(&state).await.unwrap();
+        assert!(!db::settle_invoice(&pool, "incoming", 31_000).await.unwrap());
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 31_000);
+    }
+
+    #[tokio::test]
+    async fn malformed_paid_invoice_cannot_credit_balance() {
+        let pool = db::tests::fresh_pool().await;
+        let user = db::tests::make_user(&pool, "receiver").await;
+        db::tests::make_invoice(&pool, user, "incoming", 30_000).await;
+        let (path, server) = crate::test_support::rpc(vec![(
+            "listinvoices",
+            json!({"label": "test-incoming"}),
+            json!({"invoices": [{"payment_hash": "incoming", "status": "paid"}]}),
+        )])
+        .await;
+        let state = AppState {
+            rpc_path: path,
+            db: pool.clone(),
+            min_deposit_confs: 6,
+        };
+        reconcile_incoming_once(&state).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(db::balance_msat(&pool, user).await.unwrap(), 0);
+        assert_eq!(db::invoices::list_unsettled(&pool).await.unwrap().len(), 1);
+    }
 }

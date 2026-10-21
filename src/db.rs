@@ -991,10 +991,12 @@ pub struct PendingPayment {
     pub created_at: i64,
 }
 
+type PendingPaymentRow = (i64, i64, String, i64, i64, i64, Option<String>);
+
 /// All payments still in `external_pending`. The reconciler enumerates
 /// these and asks CLN's `listpays` what really happened to each.
 pub async fn list_pending_external(pool: &Pool) -> Result<Vec<PendingPayment>> {
-    let rows: Vec<(i64, i64, String, i64, i64, i64, Option<String>)> = sqlx::query_as(
+    let rows: Vec<PendingPaymentRow> = sqlx::query_as(
         "SELECT id, user_id, payment_hash, amount_msat, fee_msat, created_at, cln_label \
          FROM payments WHERE status = 'external_pending'",
     )

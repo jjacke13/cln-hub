@@ -283,6 +283,8 @@ The deposit watcher also recovers outputs spent while the hub was stopped. It ch
 
 Only **completed** payments appear here. Failed and in-flight Lightning payments are not exposed via `/gettxs`.
 
+CLN RPC calls have a deadline of 30 seconds, or 120 seconds for `pay` to allow for route retries. A timed-out payment has an unknown outcome: its funds remain reserved until reconciliation confirms settlement or failure. A timeout is not a refund or proof that the payment failed.
+
 ### `GET /getpending`
 
 Pending on-chain deposits. Always returns `[]` — deposits credit only after they reach the configured number of confirmations (see `cln-hub-min-deposit-confs`), so there is no "pending" state visible to clients.
